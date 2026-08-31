@@ -1,5 +1,4 @@
 import os
-import json
 import re
 from datetime import datetime, timezone
 
@@ -7,6 +6,7 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 from dotenv import load_dotenv
+import httpx
 
 
 # ============================================================
@@ -15,12 +15,26 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-TOKEN = os.getenv("DISCORD_TOKEN")
+DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
+MARKETPLACE_API_URL = os.getenv("MARKETPLACE_API_URL")
+MARKETPLACE_API_KEY = os.getenv("MARKETPLACE_API_KEY")
 
-if not TOKEN:
+if not DISCORD_TOKEN:
     raise RuntimeError(
-        "DISCORD_TOKEN is missing from your .env file."
+        "DISCORD_TOKEN is missing from .env"
     )
+
+if not MARKETPLACE_API_URL:
+    raise RuntimeError(
+        "MARKETPLACE_API_URL is missing from .env"
+    )
+
+if not MARKETPLACE_API_KEY:
+    raise RuntimeError(
+        "MARKETPLACE_API_KEY is missing from .env"
+    )
+
+MARKETPLACE_API_URL = MARKETPLACE_API_URL.rstrip("/")
 
 
 # ============================================================
@@ -29,93 +43,311 @@ if not TOKEN:
 
 TEST_GUILD_ID = 1543964932200996914
 
-CONFIG_FILE = "config.json"
-
 
 # ============================================================
-# CONFIG SYSTEM
+# API CLIENT
 # ============================================================
 
-def load_config():
-
-    if not os.path.exists(CONFIG_FILE):
-        return {}
-
-    try:
-        with open(CONFIG_FILE, "r", encoding="utf-8") as file:
-            return json.load(file)
-
-    except (json.JSONDecodeError, OSError):
-        return {}
-
-
-def save_config(config):
-
-    with open(CONFIG_FILE, "w", encoding="utf-8") as file:
-        json.dump(config, file, indent=4)
-
-
-config = load_config()
-
-
-# ============================================================
-# BOT
-# ============================================================
-
-class SDBSTBot(commands.Bot):
+class MarketplaceAPI:
 
     def __init__(self):
 
-        intents = discord.Intents.default()
-
-        super().__init__(
-            command_prefix="!",
-            intents=intents
+        self.client = httpx.AsyncClient(
+            base_url=MARKETPLACE_API_URL,
+            headers={
+                "X-API-Key": MARKETPLACE_API_KEY
+            },
+            timeout=httpx.Timeout(
+                15.0,
+                connect=10.0
+            )
         )
 
-    async def setup_hook(self):
+    async def close(self):
 
-        guild = discord.Object(id=TEST_GUILD_ID)
+        if not self.client.is_closed:
+            await self.client.aclose()
 
-        # Copy our commands to the test server.
-        self.tree.copy_global_to(guild=guild)
 
-        synced = await self.tree.sync(guild=guild)
+    async def health(self):
+
+        response = await self.client.get(
+            "/api/public/bot/health"
+        )
+
+        response.raise_for_status()
+
+        return response.json()
+
+
+    async def get_config(self, server_id):
+
+        response = await self.client.get(
+            f"/api/public/bot/config/{server_id}"
+        )
+
+        if response.status_code == 404:
+            return {}
+
+        response.raise_for_status()
+
+        data = response.json()
+
+        if isinstance(data, dict):
+
+            # Some APIs return:
+            # {"config": {...}}
+            if isinstance(data.get("config"), dict):
+                return data["config"]
+
+            return data
+
+        return {}
+
+
+    async def save_config(self, server_id, data):
+
+        response = await self.client.put(
+            f"/api/public/bot/config/{server_id}",
+            json=data
+        )
+
+        response.raise_for_status()
+
+        return response.json()
+
+
+    async def patch_config(self, server_id, data):
+
+        response = await self.client.patch(
+            f"/api/public/bot/config/{server_id}",
+            json=data
+        )
+
+        response.raise_for_status()
+
+        return response.json()
+
+
+    async def list_ads(self, server_id, limit=100):
+
+        response = await self.client.get(
+            "/api/public/bot/ads",
+            params={
+                "server_id": str(server_id),
+                "limit": limit
+            }
+        )
+
+        response.raise_for_status()
+
+        data = response.json()
+
+        if isinstance(data, dict):
+            return data.get("ads", [])
+
+        if isinstance(data, list):
+            return data
+
+        return []
+
+
+    async def create_ad(self, data):
+
+        response = await self.client.post(
+            "/api/public/bot/ads",
+            json=data
+        )
+
+        response.raise_for_status()
+
+        return response.json()
+
+
+    async def get_ad(self, ad_id):
+
+        response = await self.client.get(
+            f"/api/public/bot/ads/{ad_id}"
+        )
+
+        if response.status_code == 404:
+            return None
+
+        response.raise_for_status()
+
+        return response.json()
+
+
+    async def update_ad(self, ad_id, data):
+
+        response = await self.client.patch(
+            f"/api/public/bot/ads/{ad_id}",
+            json=data
+        )
+
+        response.raise_for_status()
+
+        return response.json()
+
+
+    async def complete_ad(self, ad_id):
+
+        response = await self.client.post(
+            f"/api/public/bot/ads/{ad_id}/complete"
+        )
+
+        response.raise_for_status()
+
+        return response.json()
+
+
+    async def delete_ad(self, ad_id):
+
+        response = await self.client.delete(
+            f"/api/public/bot/ads/{ad_id}"
+        )
+
+        response.raise_for_status()
+
+
+    async def list_tickets(self, server_id):
+
+        response = await self.client.get(
+            "/api/public/bot/tickets",
+            params={
+                "server_id": str(server_id)
+            }
+        )
+
+        response.raise_for_status()
+
+        data = response.json()
+
+        if isinstance(data, dict):
+            return data.get("tickets", [])
+
+        if isinstance(data, list):
+            return data
+
+        return []
+
+
+    async def create_ticket(self, data):
+
+        response = await self.client.post(
+            "/api/public/bot/tickets",
+            json=data
+        )
+
+        response.raise_for_status()
+
+        return response.json()
+
+
+    async def get_ticket(self, ticket_id):
+
+        response = await self.client.get(
+            f"/api/public/bot/tickets/{ticket_id}"
+        )
+
+        if response.status_code == 404:
+            return None
+
+        response.raise_for_status()
+
+        return response.json()
+
+
+    async def update_ticket(self, ticket_id, data):
+
+        response = await self.client.patch(
+            f"/api/public/bot/tickets/{ticket_id}",
+            json=data
+        )
+
+        response.raise_for_status()
+
+        return response.json()
+
+
+    async def close_ticket(self, ticket_id):
+
+        response = await self.client.post(
+            f"/api/public/bot/tickets/{ticket_id}/close"
+        )
+
+        response.raise_for_status()
+
+        return response.json()
+
+
+api = MarketplaceAPI()
+
+
+# ============================================================
+# HELPERS
+# ============================================================
+
+def money(value):
+
+    try:
+        return f"${float(value):,.2f} USD"
+
+    except (TypeError, ValueError):
+        return str(value)
+
+
+def safe_name(value):
+
+    value = re.sub(
+        r"[^a-z0-9]",
+        "",
+        str(value).lower()
+    )
+
+    return value[:12] or "user"
+
+
+def ticket_channel_name(buyer, seller):
+
+    return (
+        f"ticket-{safe_name(buyer)}-{safe_name(seller)}"
+    )[:100]
+
+
+async def get_server_config(guild_id):
+
+    try:
+
+        return await api.get_config(
+            guild_id
+        )
+
+    except Exception as e:
 
         print(
-            f"Synced {len(synced)} slash command(s) "
-            f"to test server."
+            f"[API] Failed to get config: {e}"
         )
 
-    async def on_ready(self):
-
-        print(f"Logged in as {self.user}")
-        print(f"Bot ID: {self.user.id}")
+        return {}
 
 
-bot = SDBSTBot()
-
-
-# ============================================================
-# HELPER FUNCTIONS
-# ============================================================
-
-def get_server_config(guild_id):
-
-    guild_id = str(guild_id)
-
-    if guild_id not in config:
-        config[guild_id] = {}
-
-    return config[guild_id]
-
-
-def channel_mention(guild, channel_id):
+def configured_channel(guild, channel_id):
 
     if not channel_id:
         return "❌ Not configured"
 
-    channel = guild.get_channel(channel_id)
+    try:
+
+        channel_id = int(channel_id)
+
+    except (TypeError, ValueError):
+
+        return "⚠️ Invalid channel ID"
+
+    channel = guild.get_channel(
+        channel_id
+    )
 
     if channel:
         return channel.mention
@@ -123,25 +355,36 @@ def channel_mention(guild, channel_id):
     return "⚠️ Channel not found"
 
 
-def safe_channel_name(user1, user2):
+async def safe_error(
+    interaction,
+    message
+):
 
-    name1 = re.sub(
-        r"[^a-z0-9]",
-        "",
-        user1.name.lower()
-    )[:12]
+    try:
 
-    name2 = re.sub(
-        r"[^a-z0-9]",
-        "",
-        user2.name.lower()
-    )[:12]
+        if interaction.response.is_done():
 
-    return f"ticket-{name1}-{name2}"[:100]
+            await interaction.followup.send(
+                message,
+                ephemeral=True
+            )
+
+        else:
+
+            await interaction.response.send_message(
+                message,
+                ephemeral=True
+            )
+
+    except Exception as e:
+
+        print(
+            f"[ERROR RESPONSE] {e}"
+        )
 
 
 # ============================================================
-# AD EMBED
+# AD EMBEDS
 # ============================================================
 
 def create_ad_embed(
@@ -178,7 +421,7 @@ def create_ad_embed(
         f"{item}\n\n"
 
         f"💵 **Price**\n"
-        f"${price:,.2f} USD"
+        f"{money(price)}"
     )
 
     embed.set_author(
@@ -202,83 +445,199 @@ def create_ad_embed(
     return embed
 
 
-# ============================================================
-# SETUP COMMAND
-# ============================================================
-
-@bot.tree.command(
-    name="setup",
-    description="Configure SDBST Marketplace for this server."
-)
-@app_commands.checks.has_permissions(
-    administrator=True
-)
-async def setup(
-    interaction: discord.Interaction
+def create_ad_embed_from_data(
+    guild,
+    ad
 ):
 
-    guild = interaction.guild
-
-    if guild is None:
-        await interaction.response.send_message(
-            "❌ This command must be used inside a server.",
-            ephemeral=True
-        )
-        return
-
-    server_config = get_server_config(
-        guild.id
+    owner_id = ad.get(
+        "owner_id"
     )
 
-    buying_id = server_config.get(
-        "buying_channel"
-    )
+    member = None
 
-    selling_id = server_config.get(
-        "selling_channel"
-    )
+    if owner_id:
 
-    ticket_id = server_config.get(
-        "ticket_category"
-    )
+        try:
 
-    mm_id = server_config.get(
-        "mm_channel"
-    )
+            member = guild.get_member(
+                int(owner_id)
+            )
+
+        except (TypeError, ValueError):
+
+            pass
+
+    if ad.get("ad_type") == "WTB":
+
+        title = "🟢  WANT TO BUY"
+        color = discord.Color.green()
+        action = "is looking to buy"
+
+    else:
+
+        title = "🔵  WANT TO SELL"
+        color = discord.Color.blue()
+        action = "is looking to sell"
+
+    if member:
+
+        author_name = str(member)
+        mention = member.mention
+
+    else:
+
+        author_name = f"User {owner_id}"
+        mention = f"<@{owner_id}>"
 
     embed = discord.Embed(
-        title="⚙️ SDBST Marketplace Setup",
-        description=(
-            "Configure the marketplace using "
-            "the selectors below.\n\n"
-
-            f"🟢 **Buying Channel:** "
-            f"{channel_mention(guild, buying_id)}\n"
-
-            f"🔵 **Selling Channel:** "
-            f"{channel_mention(guild, selling_id)}\n"
-
-            f"🎫 **Ticket Category:** "
-            f"{channel_mention(guild, ticket_id)}\n"
-
-            f"🤝 **MM Channel:** "
-            f"{channel_mention(guild, mm_id)}"
-        ),
-        color=discord.Color.blurple()
+        title=title,
+        color=color,
+        timestamp=datetime.now(timezone.utc)
     )
+
+    embed.description = (
+        f"**{mention}** {action}\n\n"
+
+        f"🏷️ **Item**\n"
+        f"{ad.get('item', 'Unknown')}\n\n"
+
+        f"💵 **Price**\n"
+        f"{money(ad.get('price'))}"
+    )
+
+    if member:
+
+        embed.set_author(
+            name=author_name,
+            icon_url=member.display_avatar.url
+        )
+
+    else:
+
+        embed.set_author(
+            name=author_name
+        )
+
+    image = ad.get(
+        "image_url"
+    )
+
+    if image:
+
+        embed.set_image(
+            url=image
+        )
 
     embed.set_footer(
         text=(
-            "Only server administrators "
-            "can change these settings."
+            "SDBST Marketplace • "
+            "Use the buttons below to interact"
         )
     )
 
-    await interaction.response.send_message(
-        embed=embed,
-        view=SetupView(),
-        ephemeral=True
-    )
+    return embed
+
+
+# ============================================================
+# BOT
+# ============================================================
+
+class SDBSTBot(commands.Bot):
+
+    def __init__(self):
+
+        intents = discord.Intents.default()
+
+        super().__init__(
+            command_prefix="!",
+            intents=intents
+        )
+
+        self.views_restored = False
+
+
+    async def setup_hook(self):
+
+        guild = discord.Object(
+            id=TEST_GUILD_ID
+        )
+
+        # Copy global commands to test guild.
+        self.tree.copy_global_to(
+            guild=guild
+        )
+
+        synced = await self.tree.sync(
+            guild=guild
+        )
+
+        print(
+            f"Synced {len(synced)} slash command(s) "
+            f"to test server."
+        )
+
+        # IMPORTANT:
+        # Do NOT call wait_until_ready() here.
+        #
+        # setup_hook runs BEFORE the Discord gateway
+        # becomes ready. Waiting for ready here causes
+        # a startup deadlock.
+        #
+        # Persistent views are restored from on_ready().
+
+
+    async def on_ready(self):
+
+        print(
+            f"Logged in as {self.user}"
+        )
+
+        print(
+            f"Bot ID: {self.user.id}"
+        )
+
+        # Test backend connection.
+
+        try:
+
+            health = await api.health()
+
+            print(
+                "Lovable backend: ONLINE"
+            )
+
+            print(
+                f"Backend response: {health}"
+            )
+
+        except Exception as e:
+
+            print(
+                f"Lovable backend: OFFLINE ({e})"
+            )
+
+        # Restore persistent views only once.
+
+        if not self.views_restored:
+
+            self.views_restored = True
+
+            await restore_persistent_views()
+
+
+    async def close(self):
+
+        print(
+            "Shutting down..."
+        )
+
+        await api.close()
+
+        await super().close()
+
+
+bot = SDBSTBot()
 
 
 # ============================================================
@@ -294,16 +653,49 @@ class SetupView(discord.ui.View):
         )
 
 
-    # --------------------------------------------------------
-    # BUYING CHANNEL
-    # --------------------------------------------------------
+    async def save(
+        self,
+        interaction,
+        key,
+        value
+    ):
+
+        try:
+
+            await api.patch_config(
+                interaction.guild.id,
+                {
+                    key: str(value)
+                }
+            )
+
+            await interaction.response.send_message(
+                (
+                    f"✅ **"
+                    f"{key.replace('_', ' ').title()}"
+                    f"** updated."
+                ),
+                ephemeral=True
+            )
+
+        except Exception as e:
+
+            print(
+                f"[SETUP] {e}"
+            )
+
+            await safe_error(
+                interaction,
+                "❌ Couldn't save that setting to the backend."
+            )
+
 
     @discord.ui.select(
         cls=discord.ui.ChannelSelect,
         channel_types=[
             discord.ChannelType.text
         ],
-        placeholder="🟢 Select the Buying Channel",
+        placeholder="🟢 Select Buying Channel",
         custom_id="setup:buying"
     )
     async def buying_channel(
@@ -314,42 +706,26 @@ class SetupView(discord.ui.View):
 
         if not interaction.user.guild_permissions.administrator:
 
-            await interaction.response.send_message(
-                "❌ Administrator permissions required.",
-                ephemeral=True
+            await safe_error(
+                interaction,
+                "❌ Administrator permissions required."
             )
 
             return
 
-        channel = select.values[0]
-
-        server_config = get_server_config(
-            interaction.guild.id
+        await self.save(
+            interaction,
+            "buying_channel_id",
+            select.values[0].id
         )
 
-        server_config[
-            "buying_channel"
-        ] = channel.id
-
-        save_config(config)
-
-        await interaction.response.send_message(
-            f"🟢 Buying channel set to "
-            f"{channel.mention}.",
-            ephemeral=True
-        )
-
-
-    # --------------------------------------------------------
-    # SELLING CHANNEL
-    # --------------------------------------------------------
 
     @discord.ui.select(
         cls=discord.ui.ChannelSelect,
         channel_types=[
             discord.ChannelType.text
         ],
-        placeholder="🔵 Select the Selling Channel",
+        placeholder="🔵 Select Selling Channel",
         custom_id="setup:selling"
     )
     async def selling_channel(
@@ -360,42 +736,26 @@ class SetupView(discord.ui.View):
 
         if not interaction.user.guild_permissions.administrator:
 
-            await interaction.response.send_message(
-                "❌ Administrator permissions required.",
-                ephemeral=True
+            await safe_error(
+                interaction,
+                "❌ Administrator permissions required."
             )
 
             return
 
-        channel = select.values[0]
-
-        server_config = get_server_config(
-            interaction.guild.id
+        await self.save(
+            interaction,
+            "selling_channel_id",
+            select.values[0].id
         )
 
-        server_config[
-            "selling_channel"
-        ] = channel.id
-
-        save_config(config)
-
-        await interaction.response.send_message(
-            f"🔵 Selling channel set to "
-            f"{channel.mention}.",
-            ephemeral=True
-        )
-
-
-    # --------------------------------------------------------
-    # TICKET CATEGORY
-    # --------------------------------------------------------
 
     @discord.ui.select(
         cls=discord.ui.ChannelSelect,
         channel_types=[
             discord.ChannelType.category
         ],
-        placeholder="🎫 Select the Ticket Category",
+        placeholder="🎫 Select Ticket Category",
         custom_id="setup:tickets"
     )
     async def ticket_category(
@@ -406,42 +766,26 @@ class SetupView(discord.ui.View):
 
         if not interaction.user.guild_permissions.administrator:
 
-            await interaction.response.send_message(
-                "❌ Administrator permissions required.",
-                ephemeral=True
+            await safe_error(
+                interaction,
+                "❌ Administrator permissions required."
             )
 
             return
 
-        category = select.values[0]
-
-        server_config = get_server_config(
-            interaction.guild.id
+        await self.save(
+            interaction,
+            "ticket_category_id",
+            select.values[0].id
         )
 
-        server_config[
-            "ticket_category"
-        ] = category.id
-
-        save_config(config)
-
-        await interaction.response.send_message(
-            f"🎫 Ticket category set to "
-            f"**{category.name}**.",
-            ephemeral=True
-        )
-
-
-    # --------------------------------------------------------
-    # MM CHANNEL
-    # --------------------------------------------------------
 
     @discord.ui.select(
         cls=discord.ui.ChannelSelect,
         channel_types=[
             discord.ChannelType.text
         ],
-        placeholder="🤝 Select the MM Channel",
+        placeholder="🤝 Select MM Channel",
         custom_id="setup:mm"
     )
     async def mm_channel(
@@ -452,30 +796,262 @@ class SetupView(discord.ui.View):
 
         if not interaction.user.guild_permissions.administrator:
 
+            await safe_error(
+                interaction,
+                "❌ Administrator permissions required."
+            )
+
+            return
+
+        await self.save(
+            interaction,
+            "mm_channel_id",
+            select.values[0].id
+        )
+
+
+# ============================================================
+# /SETUP
+# ============================================================
+
+@bot.tree.command(
+    name="setup",
+    description="Configure SDBST Marketplace."
+)
+@app_commands.checks.has_permissions(
+    administrator=True
+)
+async def setup(
+    interaction: discord.Interaction
+):
+
+    if interaction.guild is None:
+
+        await interaction.response.send_message(
+            "❌ This command must be used inside a server.",
+            ephemeral=True
+        )
+
+        return
+
+    await interaction.response.defer(
+        ephemeral=True
+    )
+
+    server_config = await get_server_config(
+        interaction.guild.id
+    )
+
+    buying_ch = configured_channel(
+        interaction.guild,
+        server_config.get(
+            "buying_channel_id"
+        )
+    )
+
+    selling_ch = configured_channel(
+        interaction.guild,
+        server_config.get(
+            "selling_channel_id"
+        )
+    )
+
+    ticket_cat = configured_channel(
+        interaction.guild,
+        server_config.get(
+            "ticket_category_id"
+        )
+    )
+
+    mm_ch = configured_channel(
+        interaction.guild,
+        server_config.get(
+            "mm_channel_id"
+        )
+    )
+
+    embed = discord.Embed(
+        title="⚙️ SDBST Marketplace Setup",
+        description=(
+            "Use the selectors below to configure "
+            "your marketplace.\n\n"
+
+            f"🟢 **Buying Channel:** "
+            f"{buying_ch}\n"
+
+            f"🔵 **Selling Channel:** "
+            f"{selling_ch}\n"
+
+            f"🎫 **Ticket Category:** "
+            f"{ticket_cat}\n"
+
+            f"🤝 **MM Channel:** "
+            f"{mm_ch}"
+        ),
+        color=discord.Color.blurple()
+    )
+
+    embed.set_footer(
+        text=(
+            "Only server administrators "
+            "can configure the bot."
+        )
+    )
+
+    await interaction.followup.send(
+        embed=embed,
+        view=SetupView(),
+        ephemeral=True
+    )
+
+
+# ============================================================
+# EDIT AD MODAL
+# ============================================================
+
+class EditAdModal(discord.ui.Modal):
+
+    def __init__(self, ad):
+
+        super().__init__(
+            title="✏️ Edit Advertisement"
+        )
+
+        self.ad = ad
+
+        self.item_input = discord.ui.TextInput(
+            label="Item",
+            default=str(
+                ad.get("item", "")
+            ),
+            max_length=100,
+            required=True
+        )
+
+        self.price_input = discord.ui.TextInput(
+            label="Price (USD)",
+            default=str(
+                ad.get("price", "")
+            ),
+            max_length=20,
+            required=True
+        )
+
+        self.image_input = discord.ui.TextInput(
+            label="Image URL (optional)",
+            default=str(
+                ad.get("image_url") or ""
+            ),
+            required=False
+        )
+
+        self.add_item(
+            self.item_input
+        )
+
+        self.add_item(
+            self.price_input
+        )
+
+        self.add_item(
+            self.image_input
+        )
+
+
+    async def on_submit(
+        self,
+        interaction: discord.Interaction
+    ):
+
+        try:
+
+            price = float(
+                self.price_input.value
+            )
+
+            if price <= 0:
+                raise ValueError
+
+        except ValueError:
+
             await interaction.response.send_message(
-                "❌ Administrator permissions required.",
+                (
+                    "❌ Price must be a valid "
+                    "number greater than $0."
+                ),
                 ephemeral=True
             )
 
             return
 
-        channel = select.values[0]
+        item = self.item_input.value.strip()
 
-        server_config = get_server_config(
-            interaction.guild.id
-        )
+        image = self.image_input.value.strip()
 
-        server_config[
-            "mm_channel"
-        ] = channel.id
+        data = {
+            "item": item,
+            "price": str(price),
+            "image_url": image or None
+        }
 
-        save_config(config)
+        try:
 
-        await interaction.response.send_message(
-            f"🤝 MM channel set to "
-            f"{channel.mention}.",
-            ephemeral=True
-        )
+            await api.update_ad(
+                self.ad["ad_id"],
+                data
+            )
+
+            channel = interaction.guild.get_channel(
+                int(self.ad["channel_id"])
+            )
+
+            if channel:
+
+                try:
+
+                    message = await channel.fetch_message(
+                        int(self.ad["message_id"])
+                    )
+
+                    updated_ad = dict(
+                        self.ad
+                    )
+
+                    updated_ad.update(
+                        data
+                    )
+
+                    embed = create_ad_embed_from_data(
+                        interaction.guild,
+                        updated_ad
+                    )
+
+                    await message.edit(
+                        embed=embed,
+                        view=AdButtons(
+                            updated_ad
+                        )
+                    )
+
+                except discord.NotFound:
+
+                    pass
+
+            await interaction.response.send_message(
+                "✅ Advertisement updated.",
+                ephemeral=True
+            )
+
+        except Exception as e:
+
+            print(
+                f"[EDIT] {e}"
+            )
+
+            await safe_error(
+                interaction,
+                "❌ Failed to update the advertisement."
+            )
 
 
 # ============================================================
@@ -484,20 +1060,13 @@ class SetupView(discord.ui.View):
 
 class AdButtons(discord.ui.View):
 
-    def __init__(
-        self,
-        seller_id,
-        item,
-        price
-    ):
+    def __init__(self, ad):
 
         super().__init__(
             timeout=None
         )
 
-        self.seller_id = seller_id
-        self.item = item
-        self.price = price
+        self.ad = ad
 
 
     # ========================================================
@@ -507,7 +1076,8 @@ class AdButtons(discord.ui.View):
     @discord.ui.button(
         label="Offer",
         emoji="🟢",
-        style=discord.ButtonStyle.success
+        style=discord.ButtonStyle.success,
+        custom_id="ad:offer"
     )
     async def offer(
         self,
@@ -519,49 +1089,74 @@ class AdButtons(discord.ui.View):
 
         if guild is None:
 
-            await interaction.response.send_message(
-                "❌ This can only be used inside a server.",
-                ephemeral=True
+            await safe_error(
+                interaction,
+                "❌ This can only be used inside a server."
             )
 
             return
 
+        try:
 
-        # ----------------------------------------------------
-        # Prevent seller from offering on own ad
-        # ----------------------------------------------------
+            owner_id = int(
+                self.ad["owner_id"]
+            )
 
-        if interaction.user.id == self.seller_id:
+        except (TypeError, ValueError, KeyError):
 
-            await interaction.response.send_message(
-                "❌ You can't offer on your own ad.",
-                ephemeral=True
+            await safe_error(
+                interaction,
+                "❌ This advertisement has invalid owner data."
             )
 
             return
 
+        if interaction.user.id == owner_id:
 
-        server_config = get_server_config(
+            await safe_error(
+                interaction,
+                "❌ You can't offer on your own ad."
+            )
+
+            return
+
+        config = await get_server_config(
             guild.id
         )
 
-        ticket_category_id = server_config.get(
-            "ticket_category"
+        category_id = config.get(
+            "ticket_category_id"
         )
 
-        if not ticket_category_id:
+        if not category_id:
 
-            await interaction.response.send_message(
-                "❌ Tickets aren't configured yet. "
-                "An administrator needs to run `/setup`.",
-                ephemeral=True
+            await safe_error(
+                interaction,
+                (
+                    "❌ Tickets aren't configured. "
+                    "Ask an administrator to run `/setup`."
+                )
             )
 
             return
 
+        try:
+
+            category_id = int(
+                category_id
+            )
+
+        except (TypeError, ValueError):
+
+            await safe_error(
+                interaction,
+                "❌ Ticket category configuration is invalid."
+            )
+
+            return
 
         category = guild.get_channel(
-            ticket_category_id
+            category_id
         )
 
         if not isinstance(
@@ -569,65 +1164,117 @@ class AdButtons(discord.ui.View):
             discord.CategoryChannel
         ):
 
-            await interaction.response.send_message(
-                "❌ The configured ticket category "
-                "is invalid.",
-                ephemeral=True
+            await safe_error(
+                interaction,
+                (
+                    "❌ The configured ticket "
+                    "category doesn't exist."
+                )
             )
 
             return
-
-
-        # ----------------------------------------------------
-        # Fetch seller directly from Discord
-        # ----------------------------------------------------
 
         try:
 
             seller = await guild.fetch_member(
-                self.seller_id
+                owner_id
             )
 
         except discord.NotFound:
 
-            await interaction.response.send_message(
-                "❌ I couldn't find the ad owner.",
-                ephemeral=True
+            await safe_error(
+                interaction,
+                "❌ I couldn't find the ad owner."
             )
 
             return
 
+        except discord.HTTPException as e:
+
+            print(
+                f"[FETCH SELLER] {e}"
+            )
+
+            await safe_error(
+                interaction,
+                "❌ Discord couldn't find the ad owner."
+            )
+
+            return
 
         # ----------------------------------------------------
-        # Ticket name
+        # Duplicate ticket check
         # ----------------------------------------------------
 
-        ticket_name = safe_channel_name(
-            seller,
-            interaction.user
-        )
+        try:
 
+            tickets = await api.list_tickets(
+                guild.id
+            )
 
-        # ----------------------------------------------------
-        # Prevent duplicate ticket
-        # ----------------------------------------------------
+            for ticket in tickets:
 
-        for channel in category.channels:
+                if ticket.get("status") != "open":
+                    continue
 
-            if channel.name == ticket_name:
-
-                await interaction.response.send_message(
-                    f"❌ You already have a ticket: "
-                    f"{channel.mention}",
-                    ephemeral=True
+                buyer = str(
+                    ticket.get("buyer_id")
                 )
 
-                return
+                seller_db = str(
+                    ticket.get("seller_id")
+                )
 
+                if (
+                    buyer == str(interaction.user.id)
+                    and seller_db == str(owner_id)
+                ):
+
+                    existing_channel_id = ticket.get(
+                        "channel_id"
+                    )
+
+                    if existing_channel_id:
+
+                        try:
+
+                            existing = guild.get_channel(
+                                int(existing_channel_id)
+                            )
+
+                        except (
+                            TypeError,
+                            ValueError
+                        ):
+
+                            existing = None
+
+                        if existing:
+
+                            await safe_error(
+                                interaction,
+                                (
+                                    "❌ You already have "
+                                    f"a ticket: {existing.mention}"
+                                )
+                            )
+
+                            return
+
+        except Exception as e:
+
+            print(
+                f"[TICKET CHECK] {e}"
+            )
 
         # ----------------------------------------------------
-        # Ticket permissions
+        # Create Discord ticket
         # ----------------------------------------------------
+
+        ticket_name = ticket_channel_name(
+            interaction.user,
+            seller
+        )
 
         overwrites = {
 
@@ -659,34 +1306,99 @@ class AdButtons(discord.ui.View):
                 )
         }
 
-
-        # ----------------------------------------------------
-        # Create ticket
-        # ----------------------------------------------------
-
         try:
 
-            ticket = await guild.create_text_channel(
+            ticket_channel = await guild.create_text_channel(
                 name=ticket_name,
                 category=category,
                 overwrites=overwrites,
                 topic=(
-                    f"SDBST ticket • "
-                    f"{self.item} • "
-                    f"${self.price:,.2f}"
+                    f"SDBST Trade • "
+                    f"{self.ad.get('item')} • "
+                    f"{money(self.ad.get('price'))}"
                 )
             )
 
         except discord.Forbidden:
 
-            await interaction.response.send_message(
-                "❌ I don't have permission to create "
-                "ticket channels.",
-                ephemeral=True
+            await safe_error(
+                interaction,
+                (
+                    "❌ I don't have permission "
+                    "to create ticket channels."
+                )
             )
 
             return
 
+        except discord.HTTPException as e:
+
+            print(
+                f"[CHANNEL CREATE] {e}"
+            )
+
+            await safe_error(
+                interaction,
+                "❌ Discord failed to create the ticket."
+            )
+
+            return
+
+        # ----------------------------------------------------
+        # Save ticket to backend
+        # ----------------------------------------------------
+
+        ticket_data = {
+
+            "server_id":
+                str(guild.id),
+
+            "ad_id":
+                str(self.ad["ad_id"]),
+
+            "channel_id":
+                str(ticket_channel.id),
+
+            "buyer_id":
+                str(interaction.user.id),
+
+            "seller_id":
+                str(owner_id)
+        }
+
+        try:
+
+            ticket_record = await api.create_ticket(
+                ticket_data
+            )
+
+        except Exception as e:
+
+            print(
+                f"[TICKET API] {e}"
+            )
+
+            try:
+
+                await ticket_channel.delete(
+                    reason=(
+                        "Backend ticket creation failed"
+                    )
+                )
+
+            except Exception:
+                pass
+
+            await safe_error(
+                interaction,
+                (
+                    "❌ The ticket couldn't be "
+                    "saved to the backend. "
+                    "Please try again."
+                )
+            )
+
+            return
 
         # ----------------------------------------------------
         # Ticket embed
@@ -703,10 +1415,10 @@ class AdButtons(discord.ui.View):
                 f"{seller.mention}\n\n"
 
                 f"🏷️ **Item**\n"
-                f"{self.item}\n\n"
+                f"{self.ad.get('item')}\n\n"
 
                 f"💵 **Price**\n"
-                f"${self.price:,.2f} USD"
+                f"{money(self.ad.get('price'))}"
             ),
             color=discord.Color.blurple(),
             timestamp=datetime.now(timezone.utc)
@@ -716,27 +1428,31 @@ class AdButtons(discord.ui.View):
             text="SDBST Marketplace • Trade safely"
         )
 
+        try:
 
-        await ticket.send(
-
-            content=(
-                f"{seller.mention} "
-                f"{interaction.user.mention}\n\n"
-                f"🎫 **Trade ticket created!**"
-            ),
-
-            embed=embed,
-
-            view=TicketButtons(
-                seller_id=self.seller_id,
-                buyer_id=interaction.user.id
+            await ticket_channel.send(
+                content=(
+                    f"{seller.mention} "
+                    f"{interaction.user.mention}\n\n"
+                    f"🎫 **Trade ticket created!**"
+                ),
+                embed=embed,
+                view=TicketButtons(
+                    ticket_record
+                )
             )
-        )
 
+        except Exception as e:
+
+            print(
+                f"[TICKET MESSAGE] {e}"
+            )
 
         await interaction.response.send_message(
-            f"✅ Your ticket has been created: "
-            f"{ticket.mention}",
+            (
+                f"✅ Your ticket has been created: "
+                f"{ticket_channel.mention}"
+            ),
             ephemeral=True
         )
 
@@ -748,7 +1464,8 @@ class AdButtons(discord.ui.View):
     @discord.ui.button(
         label="Mark Done",
         emoji="✅",
-        style=discord.ButtonStyle.secondary
+        style=discord.ButtonStyle.secondary,
+        custom_id="ad:done"
     )
     async def mark_done(
         self,
@@ -756,23 +1473,62 @@ class AdButtons(discord.ui.View):
         button
     ):
 
-        if interaction.user.id != self.seller_id:
+        try:
 
-            await interaction.response.send_message(
-                "❌ Only the person who created this ad "
-                "can mark it as done.",
-                ephemeral=True
+            owner_id = int(
+                self.ad["owner_id"]
+            )
+
+        except (TypeError, ValueError, KeyError):
+
+            await safe_error(
+                interaction,
+                "❌ Invalid advertisement owner."
             )
 
             return
 
+        if interaction.user.id != owner_id:
+
+            await safe_error(
+                interaction,
+                (
+                    "❌ Only the person who created "
+                    "this ad can mark it as done."
+                )
+            )
+
+            return
 
         await interaction.response.send_message(
-            "✅ Ad marked as completed. Deleting...",
+            (
+                "✅ Marking advertisement "
+                "as completed..."
+            ),
             ephemeral=True
         )
 
-        await interaction.message.delete()
+        try:
+
+            await api.complete_ad(
+                self.ad["ad_id"]
+            )
+
+        except Exception as e:
+
+            print(
+                f"[COMPLETE AD] {e}"
+            )
+
+        try:
+
+            await interaction.message.delete()
+
+        except Exception as e:
+
+            print(
+                f"[DELETE AD MESSAGE] {e}"
+            )
 
 
     # ========================================================
@@ -782,7 +1538,8 @@ class AdButtons(discord.ui.View):
     @discord.ui.button(
         label="Edit Ad",
         emoji="✏️",
-        style=discord.ButtonStyle.primary
+        style=discord.ButtonStyle.primary,
+        custom_id="ad:edit"
     )
     async def edit_ad(
         self,
@@ -790,20 +1547,37 @@ class AdButtons(discord.ui.View):
         button
     ):
 
-        if interaction.user.id != self.seller_id:
+        try:
 
-            await interaction.response.send_message(
-                "❌ Only the person who created this ad "
-                "can edit it.",
-                ephemeral=True
+            owner_id = int(
+                self.ad["owner_id"]
+            )
+
+        except (TypeError, ValueError, KeyError):
+
+            await safe_error(
+                interaction,
+                "❌ Invalid advertisement owner."
             )
 
             return
 
+        if interaction.user.id != owner_id:
 
-        await interaction.response.send_message(
-            "✏️ Ad editing is coming next.",
-            ephemeral=True
+            await safe_error(
+                interaction,
+                (
+                    "❌ Only the person who created "
+                    "this ad can edit it."
+                )
+            )
+
+            return
+
+        await interaction.response.send_modal(
+            EditAdModal(
+                self.ad
+            )
         )
 
 
@@ -813,18 +1587,13 @@ class AdButtons(discord.ui.View):
 
 class TicketButtons(discord.ui.View):
 
-    def __init__(
-        self,
-        seller_id,
-        buyer_id
-    ):
+    def __init__(self, ticket):
 
         super().__init__(
             timeout=None
         )
 
-        self.seller_id = seller_id
-        self.buyer_id = buyer_id
+        self.ticket = ticket
 
 
     # ========================================================
@@ -834,7 +1603,8 @@ class TicketButtons(discord.ui.View):
     @discord.ui.button(
         label="Close Ticket",
         emoji="🔒",
-        style=discord.ButtonStyle.danger
+        style=discord.ButtonStyle.danger,
+        custom_id="ticket:close"
     )
     async def close_ticket(
         self,
@@ -842,30 +1612,75 @@ class TicketButtons(discord.ui.View):
         button
     ):
 
-        if interaction.user.id not in {
-            self.seller_id,
-            self.buyer_id
-        }:
+        try:
 
-            await interaction.response.send_message(
-                "❌ You aren't part of this ticket.",
-                ephemeral=True
+            buyer_id = int(
+                self.ticket["buyer_id"]
+            )
+
+            seller_id = int(
+                self.ticket["seller_id"]
+            )
+
+        except (TypeError, ValueError, KeyError):
+
+            await safe_error(
+                interaction,
+                "❌ Invalid ticket data."
             )
 
             return
 
+        if interaction.user.id not in {
+            buyer_id,
+            seller_id
+        }:
+
+            await safe_error(
+                interaction,
+                "❌ You aren't part of this ticket."
+            )
+
+            return
 
         await interaction.response.send_message(
             "🔒 Closing ticket...",
             ephemeral=True
         )
 
-        await interaction.channel.delete(
-            reason=(
-                f"Ticket closed by "
-                f"{interaction.user}"
+        try:
+
+            await api.close_ticket(
+                self.ticket["ticket_id"]
             )
-        )
+
+        except Exception as e:
+
+            print(
+                f"[CLOSE TICKET API] {e}"
+            )
+
+        try:
+
+            await interaction.channel.delete(
+                reason=(
+                    f"Ticket closed by "
+                    f"{interaction.user}"
+                )
+            )
+
+        except discord.Forbidden:
+
+            print(
+                "[CLOSE TICKET] "
+                "Bot cannot delete ticket channel."
+            )
+
+        except discord.HTTPException as e:
+
+            print(
+                f"[CLOSE TICKET DELETE] {e}"
+            )
 
 
     # ========================================================
@@ -875,7 +1690,8 @@ class TicketButtons(discord.ui.View):
     @discord.ui.button(
         label="Request MM",
         emoji="🤝",
-        style=discord.ButtonStyle.primary
+        style=discord.ButtonStyle.primary,
+        custom_id="ticket:mm"
     )
     async def request_mm(
         self,
@@ -883,49 +1699,344 @@ class TicketButtons(discord.ui.View):
         button
     ):
 
-        guild_id = str(
+        if interaction.guild is None:
+
+            await safe_error(
+                interaction,
+                "❌ This can only be used inside a server."
+            )
+
+            return
+
+        config = await get_server_config(
             interaction.guild.id
         )
 
-        server_config = config.get(
-            guild_id,
-            {}
-        )
-
-        mm_channel_id = server_config.get(
-            "mm_channel"
+        mm_channel_id = config.get(
+            "mm_channel_id"
         )
 
         if not mm_channel_id:
 
-            await interaction.response.send_message(
-                "❌ MM channel hasn't been configured yet.",
-                ephemeral=True
+            await safe_error(
+                interaction,
+                (
+                    "❌ MM channel hasn't "
+                    "been configured yet."
+                )
             )
 
             return
 
+        try:
 
-        mm_channel = interaction.guild.get_channel(
-            mm_channel_id
-        )
+            mm_channel = interaction.guild.get_channel(
+                int(mm_channel_id)
+            )
+
+        except (TypeError, ValueError):
+
+            mm_channel = None
 
         if not mm_channel:
 
+            await safe_error(
+                interaction,
+                (
+                    "❌ The configured MM channel "
+                    "couldn't be found."
+                )
+            )
+
+            return
+
+        await interaction.response.send_message(
+            (
+                f"🤝 **Middleman Request**\n\n"
+                f"Please go to "
+                f"{mm_channel.mention} "
+                f"and request a middleman there."
+            ),
+            ephemeral=True
+        )
+
+
+# ============================================================
+# WTB / WTS MODAL
+# ============================================================
+
+class AdModal(discord.ui.Modal):
+
+    def __init__(
+        self,
+        ad_type
+    ):
+
+        super().__init__(
+            title=(
+                "🟢 Want To Buy"
+                if ad_type == "WTB"
+                else
+                "🔵 Want To Sell"
+            )
+        )
+
+        self.ad_type = ad_type
+
+        self.item_input = discord.ui.TextInput(
+            label="Item",
+            placeholder="Example: Dark Matter Katana",
+            max_length=100,
+            required=True
+        )
+
+        self.price_input = discord.ui.TextInput(
+            label="Price (USD)",
+            placeholder="Example: 15.50",
+            max_length=20,
+            required=True
+        )
+
+        self.image_input = discord.ui.TextInput(
+            label="Image URL (optional)",
+            placeholder="https://...",
+            required=False
+        )
+
+        self.add_item(
+            self.item_input
+        )
+
+        self.add_item(
+            self.price_input
+        )
+
+        self.add_item(
+            self.image_input
+        )
+
+
+    async def on_submit(
+        self,
+        interaction
+    ):
+
+        try:
+
+            price = float(
+                self.price_input.value
+            )
+
+            if price <= 0:
+                raise ValueError
+
+        except ValueError:
+
             await interaction.response.send_message(
-                "❌ The configured MM channel "
-                "couldn't be found.",
+                (
+                    "❌ Enter a valid price "
+                    "greater than $0."
+                ),
                 ephemeral=True
             )
 
             return
 
+        await interaction.response.defer(
+            ephemeral=True
+        )
 
-        await interaction.response.send_message(
+        if interaction.guild is None:
+
+            await interaction.followup.send(
+                (
+                    "❌ This command must be "
+                    "used inside a server."
+                ),
+                ephemeral=True
+            )
+
+            return
+
+        config = await get_server_config(
+            interaction.guild.id
+        )
+
+        if self.ad_type == "WTB":
+
+            channel_id = config.get(
+                "buying_channel_id"
+            )
+
+        else:
+
+            channel_id = config.get(
+                "selling_channel_id"
+            )
+
+        if not channel_id:
+
+            await interaction.followup.send(
+                (
+                    "❌ This marketplace channel "
+                    "isn't configured.\n"
+                    "Ask an administrator to "
+                    "run `/setup`."
+                ),
+                ephemeral=True
+            )
+
+            return
+
+        try:
+
+            channel = interaction.guild.get_channel(
+                int(channel_id)
+            )
+
+        except (TypeError, ValueError):
+
+            channel = None
+
+        if not channel:
+
+            await interaction.followup.send(
+                (
+                    "❌ The configured marketplace "
+                    "channel couldn't be found."
+                ),
+                ephemeral=True
+            )
+
+            return
+
+        item = self.item_input.value.strip()
+
+        image = self.image_input.value.strip()
+
+        embed = create_ad_embed(
+            interaction,
+            item,
+            price,
+            self.ad_type,
+            image or None
+        )
+
+        # ----------------------------------------------------
+        # Send message first so we get its Discord ID.
+        # ----------------------------------------------------
+
+        try:
+
+            message = await channel.send(
+                embed=embed
+            )
+
+        except discord.Forbidden:
+
+            await interaction.followup.send(
+                (
+                    "❌ I don't have permission "
+                    "to send messages in that channel."
+                ),
+                ephemeral=True
+            )
+
+            return
+
+        except discord.HTTPException as e:
+
+            print(
+                f"[AD MESSAGE] {e}"
+            )
+
+            await interaction.followup.send(
+                "❌ Discord failed to post the advertisement.",
+                ephemeral=True
+            )
+
+            return
+
+        # ----------------------------------------------------
+        # Save ad to backend.
+        # ----------------------------------------------------
+
+        try:
+
+            ad_record = await api.create_ad(
+                {
+
+                    "server_id":
+                        str(interaction.guild.id),
+
+                    "owner_id":
+                        str(interaction.user.id),
+
+                    "ad_type":
+                        self.ad_type,
+
+                    "item":
+                        item,
+
+                    "price":
+                        str(price),
+
+                    "message_id":
+                        str(message.id),
+
+                    "channel_id":
+                        str(channel.id),
+
+                    "image_url":
+                        image or None
+                }
+            )
+
+        except Exception as e:
+
+            print(
+                f"[CREATE AD API] {e}"
+            )
+
+            try:
+
+                await message.delete()
+
+            except Exception:
+                pass
+
+            await interaction.followup.send(
+                (
+                    "❌ The advertisement couldn't "
+                    "be saved to the backend."
+                ),
+                ephemeral=True
+            )
+
+            return
+
+        # ----------------------------------------------------
+        # Attach persistent buttons.
+        # ----------------------------------------------------
+
+        try:
+
+            await message.edit(
+                view=AdButtons(
+                    ad_record
+                )
+            )
+
+        except Exception as e:
+
+            print(
+                f"[AD BUTTONS] {e}"
+            )
+
+        await interaction.followup.send(
             (
-                f"🤝 Please go to "
-                f"{mm_channel.mention} "
-                f"to request a middleman."
+                f"✅ Your **{self.ad_type}** ad "
+                f"was posted in {channel.mention}."
             ),
             ephemeral=True
         )
@@ -937,94 +2048,14 @@ class TicketButtons(discord.ui.View):
 
 @bot.tree.command(
     name="wtb",
-    description="Create a Want To Buy ad."
-)
-@app_commands.describe(
-    item="The item you want to buy",
-    price="The price in USD",
-    image="Optional image URL"
+    description="Create a Want To Buy advertisement."
 )
 async def wtb(
-    interaction,
-    item: str,
-    price: float,
-    image: str | None = None
+    interaction: discord.Interaction
 ):
 
-    if price <= 0:
-
-        await interaction.response.send_message(
-            "❌ Price must be greater than $0.",
-            ephemeral=True
-        )
-
-        return
-
-
-    server_config = get_server_config(
-        interaction.guild.id
-    )
-
-    buying_channel_id = server_config.get(
-        "buying_channel"
-    )
-
-    if not buying_channel_id:
-
-        await interaction.response.send_message(
-            (
-                "❌ Buying channel hasn't been "
-                "configured.\n\n"
-                "Ask an administrator to run `/setup`."
-            ),
-            ephemeral=True
-        )
-
-        return
-
-
-    channel = interaction.guild.get_channel(
-        buying_channel_id
-    )
-
-    if not channel:
-
-        await interaction.response.send_message(
-            "❌ The configured buying channel "
-            "couldn't be found.",
-            ephemeral=True
-        )
-
-        return
-
-
-    embed = create_ad_embed(
-        interaction,
-        item,
-        price,
-        "WTB",
-        image
-    )
-
-    view = AdButtons(
-        seller_id=interaction.user.id,
-        item=item,
-        price=price
-    )
-
-
-    await channel.send(
-        embed=embed,
-        view=view
-    )
-
-
-    await interaction.response.send_message(
-        (
-            f"✅ Your WTB ad was posted in "
-            f"{channel.mention}."
-        ),
-        ephemeral=True
+    await interaction.response.send_modal(
+        AdModal("WTB")
     )
 
 
@@ -1034,94 +2065,221 @@ async def wtb(
 
 @bot.tree.command(
     name="wts",
-    description="Create a Want To Sell ad."
-)
-@app_commands.describe(
-    item="The item you want to sell",
-    price="The price in USD",
-    image="Optional image URL"
+    description="Create a Want To Sell advertisement."
 )
 async def wts(
-    interaction,
-    item: str,
-    price: float,
-    image: str | None = None
+    interaction: discord.Interaction
 ):
 
-    if price <= 0:
+    await interaction.response.send_modal(
+        AdModal("WTS")
+    )
 
-        await interaction.response.send_message(
-            "❌ Price must be greater than $0.",
-            ephemeral=True
+
+# ============================================================
+# RESTORE PERSISTENT VIEWS
+# ============================================================
+
+async def restore_persistent_views():
+
+    guild = bot.get_guild(
+        TEST_GUILD_ID
+    )
+
+    if guild is None:
+
+        print(
+            "[RESTORE] Test guild not found."
         )
 
         return
 
+    # --------------------------------------------------------
+    # Restore advertisements
+    # --------------------------------------------------------
 
-    server_config = get_server_config(
-        interaction.guild.id
-    )
+    try:
 
-    selling_channel_id = server_config.get(
-        "selling_channel"
-    )
+        ads = await api.list_ads(
+            guild.id,
+            limit=100
+        )
 
-    if not selling_channel_id:
+        restored_ads = 0
 
-        await interaction.response.send_message(
+        for ad in ads:
+
+            if ad.get("status") == "completed":
+                continue
+
+            channel_id = ad.get(
+                "channel_id"
+            )
+
+            message_id = ad.get(
+                "message_id"
+            )
+
+            if not channel_id or not message_id:
+                continue
+
+            try:
+
+                channel = guild.get_channel(
+                    int(channel_id)
+                )
+
+                if channel is None:
+                    continue
+
+                message = await channel.fetch_message(
+                    int(message_id)
+                )
+
+                bot.add_view(
+                    AdButtons(ad),
+                    message_id=message.id
+                )
+
+                restored_ads += 1
+
+            except discord.NotFound:
+
+                print(
+                    f"[RESTORE AD] Message "
+                    f"{message_id} no longer exists."
+                )
+
+            except Exception as e:
+
+                print(
+                    f"[RESTORE AD] {e}"
+                )
+
+        print(
+            f"Restored {restored_ads} "
+            f"persistent ad view(s)."
+        )
+
+    except Exception as e:
+
+        print(
+            f"[RESTORE ADS] {e}"
+        )
+
+
+    # --------------------------------------------------------
+    # Restore tickets
+    # --------------------------------------------------------
+
+    try:
+
+        tickets = await api.list_tickets(
+            guild.id
+        )
+
+        restored_tickets = 0
+
+        for ticket in tickets:
+
+            if ticket.get("status") == "closed":
+                continue
+
+            channel_id = ticket.get(
+                "channel_id"
+            )
+
+            ticket_id = ticket.get(
+                "ticket_id"
+            )
+
+            if not channel_id or not ticket_id:
+                continue
+
+            try:
+
+                channel = guild.get_channel(
+                    int(channel_id)
+                )
+
+            except (TypeError, ValueError):
+
+                channel = None
+
+            if channel is None:
+                continue
+
+            try:
+
+                async for message in channel.history(
+                    limit=20
+                ):
+
+                    if message.author.id != bot.user.id:
+                        continue
+
+                    bot.add_view(
+                        TicketButtons(ticket),
+                        message_id=message.id
+                    )
+
+                    restored_tickets += 1
+
+                    break
+
+            except Exception as e:
+
+                print(
+                    f"[RESTORE TICKET] {e}"
+                )
+
+        print(
+            f"Restored {restored_tickets} "
+            f"persistent ticket view(s)."
+        )
+
+    except Exception as e:
+
+        print(
+            f"[RESTORE TICKETS] {e}"
+        )
+
+
+# ============================================================
+# COMMAND ERROR HANDLER
+# ============================================================
+
+@bot.tree.error
+async def on_app_command_error(
+    interaction,
+    error
+):
+
+    if isinstance(
+        error,
+        app_commands.errors.MissingPermissions
+    ):
+
+        await safe_error(
+            interaction,
             (
-                "❌ Selling channel hasn't been "
-                "configured.\n\n"
-                "Ask an administrator to run `/setup`."
-            ),
-            ephemeral=True
+                "❌ You need administrator "
+                "permissions to use this command."
+            )
         )
 
         return
 
-
-    channel = interaction.guild.get_channel(
-        selling_channel_id
+    print(
+        f"[COMMAND ERROR] {repr(error)}"
     )
 
-    if not channel:
-
-        await interaction.response.send_message(
-            "❌ The configured selling channel "
-            "couldn't be found.",
-            ephemeral=True
-        )
-
-        return
-
-
-    embed = create_ad_embed(
+    await safe_error(
         interaction,
-        item,
-        price,
-        "WTS",
-        image
-    )
-
-    view = AdButtons(
-        seller_id=interaction.user.id,
-        item=item,
-        price=price
-    )
-
-
-    await channel.send(
-        embed=embed,
-        view=view
-    )
-
-
-    await interaction.response.send_message(
         (
-            f"✅ Your WTS ad was posted in "
-            f"{channel.mention}."
-        ),
-        ephemeral=True
+            "❌ Something went wrong "
+            "while running that command."
+        )
     )
 
 
@@ -1129,4 +2287,40 @@ async def wts(
 # RUN
 # ============================================================
 
-bot.run(TOKEN)
+if __name__ == "__main__":
+
+    print(
+        "============================================"
+    )
+
+    print(
+        "SDBST Marketplace Bot starting..."
+    )
+
+    print(
+        "============================================"
+    )
+
+    try:
+
+        bot.run(
+            DISCORD_TOKEN
+        )
+
+    except KeyboardInterrupt:
+
+        print(
+            "Bot stopped."
+        )
+
+    except Exception as e:
+
+        print(
+            f"[FATAL] {repr(e)}"
+        )
+
+    finally:
+
+        print(
+            "Bot shutdown complete."
+        )
