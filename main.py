@@ -1188,6 +1188,57 @@ class StickySettingsButton(discord.ui.Button):
         )
 
 
+class CommandOnlyChannelModal(discord.ui.Modal):
+
+    def __init__(self, parent):
+        super().__init__(title="🔒 Command-Only Channel")
+        self.parent_view = parent
+        self.channel_input = discord.ui.TextInput(
+            label="Channel ID (or type off to disable)",
+            placeholder="123456789012345678",
+            default=str(parent.config.get("command_only_channel_id", "")),
+            max_length=30,
+            required=False
+        )
+        self.add_item(self.channel_input)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        raw = self.channel_input.value.strip().lower()
+        if raw in {"", "off", "none", "disable"}:
+            await self.parent_view.save(interaction, "command_only_channel_id", "")
+            return
+        try:
+            channel_id = int(raw)
+        except ValueError:
+            await safe_error(interaction, "❌ Enter a valid channel ID, or type `off`.")
+            return
+        channel = interaction.guild.get_channel(channel_id)
+        if not isinstance(channel, discord.TextChannel):
+            await safe_error(interaction, "❌ I couldn't find a text channel with that ID in this server.")
+            return
+        await self.parent_view.save(interaction, "command_only_channel_id", str(channel.id))
+        await self.parent_view.save(interaction, "command_only_enabled", "true")
+
+
+class CommandOnlyChannelButton(discord.ui.Button):
+
+    def __init__(self, parent):
+        self.parent_view = parent
+        configured = bool(parent.config.get("command_only_channel_id"))
+        super().__init__(
+            label="Command-Only: ON" if configured else "Command-Only: OFF",
+            emoji="🔒",
+            style=discord.ButtonStyle.success if configured else discord.ButtonStyle.secondary,
+            row=4
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        if not interaction.user.guild_permissions.administrator:
+            await safe_error(interaction, "❌ Administrator permissions required.")
+            return
+        await interaction.response.send_modal(CommandOnlyChannelModal(self.parent_view))
+
+
 class SetupView(discord.ui.View):
 
     def __init__(
@@ -1246,6 +1297,10 @@ class SetupView(discord.ui.View):
 
         self.add_item(
             StickySettingsButton(self)
+        )
+
+        self.add_item(
+            CommandOnlyChannelButton(self)
         )
 
 
@@ -1357,6 +1412,13 @@ def setup_embed(guild, server_config):
         else "🔴 Disabled"
     )
 
+    command_only_id = server_config.get("command_only_channel_id")
+    command_only_status = (
+        f"🟢 {configured_channel(guild, command_only_id)}"
+        if command_only_id and str(server_config.get("command_only_enabled", "true")).lower() not in {"false", "0", "off", "no"}
+        else "🔴 Disabled"
+    )
+
     embed = discord.Embed(
         title="⚙️ SDBST Marketplace Setup",
         description=(
@@ -1377,7 +1439,10 @@ def setup_embed(guild, server_config):
             f"{mm_ch}\n"
 
             f"📌 **Sticky Notes:** "
-            f"{sticky_status}"
+            f"{sticky_status}\n"
+
+            f"🔒 **Command-Only Channel:** "
+            f"{command_only_status}"
         ),
         color=discord.Color.blurple()
     )
@@ -1949,6 +2014,13 @@ class AdButtons(discord.ui.View):
                 )
             )
 
+            # The second bot-style panel starts the participant selection and
+            # is deliberately separate from the ticket controls above.
+            await ticket_channel.send(
+                content="🤝 **Who are you dealing with?**",
+                view=DealSetupView(ticket_record)
+            )
+
         except Exception as e:
 
             print(
@@ -2102,6 +2174,186 @@ class AdButtons(discord.ui.View):
 
 
 # ============================================================
+# DEAL SETUP AND CONFIRMATION
+# ============================================================
+
+_deal_state = {}
+
+
+def _ticket_state_key(ticket):
+    return str(ticket.get("ticket_id") or ticket.get("channel_id"))
+
+
+def _initial_deal_state(ticket):
+    key = _ticket_state_key(ticket)
+    saved = ticket.get("deal") if isinstance(ticket.get("deal"), dict) else {}
+    state = dict(_deal_state.get(key, {}))
+    state.update(saved)
+    state.setdefault("item", ticket.get("item") or "Deal")
+    state.setdefault("value", ticket.get("deal_value") or ticket.get("price") or "Not set")
+    state.setdefault("partner_id", ticket.get("deal_partner_id") or ticket.get("seller_id"))
+    state.setdefault("confirmations", {})
+    _deal_state[key] = state
+    return state
+
+
+async def _save_deal_state(ticket, state):
+    key = _ticket_state_key(ticket)
+    _deal_state[key] = dict(state)
+    payload = {
+        "deal": state,
+        "deal_partner_id": str(state.get("partner_id")) if state.get("partner_id") else "",
+        "deal_value": str(state.get("value", "")),
+        "deal_item": str(state.get("item", ""))
+    }
+    try:
+        await api.update_ticket(ticket["ticket_id"], payload)
+    except Exception as e:
+        # The Discord flow remains usable if an older backend does not yet
+        # accept the optional deal fields; the state is retained in-process.
+        print(f"[DEAL STATE API] {e}")
+
+
+def _member_mention(guild, user_id):
+    try:
+        return guild.get_member(int(user_id)).mention
+    except (TypeError, ValueError, AttributeError):
+        return f"<@{user_id}>"
+
+
+def deal_embed(guild, ticket, state):
+    buyer_id = str(ticket.get("buyer_id"))
+    partner_id = str(state.get("partner_id")) if state.get("partner_id") else None
+    confirmations = state.get("confirmations", {})
+    buyer_ok = bool(confirmations.get(buyer_id))
+    partner_ok = bool(partner_id and confirmations.get(partner_id))
+    embed = discord.Embed(
+        title="🤝 Deal Confirmation",
+        description=(
+            f"**Deal:** {state.get('item', 'Deal')}\n"
+            f"**Value:** {money(state.get('value', 'Not set'))}\n\n"
+            f"{'✅' if buyer_ok else '❌'} {_member_mention(guild, buyer_id)} — {'Confirmed' if buyer_ok else 'Unconfirmed'}\n"
+            f"{'✅' if partner_ok else '❌'} {_member_mention(guild, partner_id) if partner_id else 'No user selected'} — {'Confirmed' if partner_ok else 'Unconfirmed'}"
+        ),
+        color=discord.Color.green() if buyer_ok and partner_ok else discord.Color.orange()
+    )
+    embed.set_footer(text="Both participants must confirm before the deal is complete.")
+    return embed
+
+
+class DealUserSelect(discord.ui.UserSelect):
+
+    def __init__(self, ticket):
+        self.ticket = ticket
+        super().__init__(placeholder="Select a user", min_values=1, max_values=1, custom_id="deal:select_user", row=0)
+
+    async def callback(self, interaction: discord.Interaction):
+        state = _initial_deal_state(self.ticket)
+        selected = self.values[0]
+        if selected.id == interaction.user.id and selected.id == int(self.ticket.get("buyer_id", 0)):
+            await safe_error(interaction, "❌ You cannot select yourself as the other deal participant.")
+            return
+        state["partner_id"] = str(selected.id)
+        state["confirmations"] = {}
+        await _save_deal_state(self.ticket, state)
+        view = DealConfirmationView(self.ticket, state)
+        await interaction.response.edit_message(
+            content=f"✅ {selected.mention} has been added to the deal. Please review and confirm below.",
+            embed=view.build_embed(interaction.guild),
+            view=view
+        )
+        try:
+            await interaction.channel.send(f"📌 {selected.mention} has been added to the ticket and the deal details were saved.")
+        except discord.HTTPException:
+            pass
+
+
+class DealSetupView(discord.ui.View):
+
+    def __init__(self, ticket):
+        super().__init__(timeout=None)
+        self.ticket = ticket
+        self.add_item(DealUserSelect(ticket))
+
+
+class EditDealModal(discord.ui.Modal):
+
+    def __init__(self, ticket, state):
+        super().__init__(title="✏️ Edit Deal")
+        self.ticket = ticket
+        self.item_input = discord.ui.TextInput(label="Deal details", default=str(state.get("item", "Deal")), max_length=100, required=True)
+        self.value_input = discord.ui.TextInput(label="Deal value (USD)", default=str(state.get("value", "")), max_length=20, required=True)
+        self.add_item(self.item_input)
+        self.add_item(self.value_input)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        try:
+            value = float(self.value_input.value.replace("$", "").replace(",", "").strip())
+            if value < 0:
+                raise ValueError
+        except ValueError:
+            await safe_error(interaction, "❌ Deal value must be a valid number.")
+            return
+        state = _initial_deal_state(self.ticket)
+        state["item"] = self.item_input.value.strip()
+        state["value"] = str(value)
+        state["confirmations"] = {}
+        await _save_deal_state(self.ticket, state)
+        view = DealConfirmationView(self.ticket, state)
+        await interaction.response.edit_message(embed=view.build_embed(interaction.guild), view=view)
+        try:
+            await interaction.channel.send("💾 The deal details have been updated. Both participants must confirm again.")
+        except discord.HTTPException:
+            pass
+
+
+class DealConfirmationView(discord.ui.View):
+
+    def __init__(self, ticket, state=None):
+        super().__init__(timeout=None)
+        self.ticket = ticket
+        self.state = state or _initial_deal_state(ticket)
+
+    def build_embed(self, guild):
+        return deal_embed(guild, self.ticket, self.state)
+
+    async def _confirm(self, interaction, participant_key):
+        buyer_id = str(self.ticket.get("buyer_id"))
+        partner_id = str(self.state.get("partner_id")) if self.state.get("partner_id") else ""
+        if participant_key == "buyer":
+            allowed_id = buyer_id
+        else:
+            allowed_id = partner_id
+        if not allowed_id or interaction.user.id != int(allowed_id):
+            await safe_error(interaction, "❌ Only the matching deal participant can use this confirmation button.")
+            return
+        self.state.setdefault("confirmations", {})[allowed_id] = True
+        await _save_deal_state(self.ticket, self.state)
+        await interaction.response.edit_message(embed=self.build_embed(interaction.guild), view=self)
+        if all(self.state["confirmations"].get(x) for x in (buyer_id, partner_id)):
+            try:
+                await interaction.channel.send("✅ **Both participants confirmed the deal.**")
+            except discord.HTTPException:
+                pass
+
+    @discord.ui.button(label="Buyer Confirm", emoji="✅", style=discord.ButtonStyle.success, custom_id="deal:confirm:buyer", row=0)
+    async def buyer_confirm(self, interaction, button):
+        await self._confirm(interaction, "buyer")
+
+    @discord.ui.button(label="Partner Confirm", emoji="✅", style=discord.ButtonStyle.success, custom_id="deal:confirm:partner", row=0)
+    async def partner_confirm(self, interaction, button):
+        await self._confirm(interaction, "partner")
+
+    @discord.ui.button(label="Edit Deal", emoji="✏️", style=discord.ButtonStyle.primary, custom_id="deal:edit", row=1)
+    async def edit_deal(self, interaction, button):
+        buyer_id = int(self.ticket.get("buyer_id", 0))
+        partner_id = int(self.state.get("partner_id", 0)) if self.state.get("partner_id") else 0
+        if interaction.user.id not in {buyer_id, partner_id}:
+            await safe_error(interaction, "❌ Only a deal participant can edit the deal.")
+            return
+        await interaction.response.send_modal(EditDealModal(self.ticket, self.state))
+
+
 # TICKET BUTTONS
 # ============================================================
 
@@ -2724,10 +2976,14 @@ async def restore_persistent_views():
                         if message.author.id != bot.user.id:
                             continue
 
-                        bot.add_view(
-                            TicketButtons(ticket),
-                            message_id=message.id
-                        )
+                        if "Trade ticket opened" in (message.content or ""):
+                            bot.add_view(TicketButtons(ticket), message_id=message.id)
+                        elif "Who are you dealing with?" in (message.content or ""):
+                            bot.add_view(DealSetupView(ticket), message_id=message.id)
+                        elif "Deal Confirmation" in (message.content or ""):
+                            bot.add_view(DealConfirmationView(ticket), message_id=message.id)
+                        else:
+                            continue
 
                         total_tickets += 1
 
@@ -2774,6 +3030,19 @@ def invalidate_config_cache(guild_id):
         int(guild_id),
         None
     )
+
+
+def command_only_enabled(config):
+    if not (config or {}).get("command_only_channel_id"):
+        return False
+    return str((config or {}).get("command_only_enabled", "true")).strip().lower() not in {"0", "false", "no", "off"}
+
+
+def is_command_only_channel(config, channel_id):
+    try:
+        return command_only_enabled(config) and int(config.get("command_only_channel_id")) == int(channel_id)
+    except (TypeError, ValueError, AttributeError):
+        return False
 
 
 async def cached_config(guild_id):
@@ -2863,6 +3132,16 @@ async def on_message(message):
     try:
 
         config = await cached_config(message.guild.id)
+
+        # Slash commands are interactions, not regular messages. Therefore
+        # deleting every non-bot message here still leaves /wtb, /wts, and
+        # other slash commands usable in the configured channel.
+        if is_command_only_channel(config, message.channel.id) and not message.author.bot:
+            try:
+                await message.delete(reason="Command-only channel")
+            except (discord.Forbidden, discord.NotFound, discord.HTTPException) as e:
+                print(f"[COMMAND-ONLY DELETE] {e}")
+            return
 
         text = sticky_text_for_channel(
             config,
