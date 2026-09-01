@@ -2275,33 +2275,12 @@ class TicketButtons(discord.ui.View):
             f"{interaction.guild.id}/{mm_channel.id}"
         )
 
-        # Name of the ticket this request came from, so the
-        # user knows exactly what to say in the MM channel.
-
-        ticket_name = None
-
-        if interaction.channel is not None:
-            ticket_name = getattr(
-                interaction.channel,
-                "name",
-                None
-            )
-
-        say_line = (
-            f"Just say: `{ticket_name}`"
-            if ticket_name
-            else "Just say your ticket name"
-        )
-
         await interaction.response.send_message(
             (
                 f"🤝 **Middleman Request**\n"
                 f"[Click here to open a ticket "
                 f"and request MM]({mm_link}) "
-                f"({mm_channel.mention})\n"
-                f"{say_line}\n"
-                f"💬 Negotiate the deal in the "
-                f"opened ticket."
+                f"({mm_channel.mention})"
             ),
             ephemeral=True
         )
