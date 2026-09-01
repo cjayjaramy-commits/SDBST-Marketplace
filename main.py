@@ -8,6 +8,10 @@ from discord import app_commands
 from discord.ext import commands
 from dotenv import load_dotenv
 import httpx
+import json
+import random
+import uuid
+from pathlib import Path
 
 
 # ============================================================
@@ -297,6 +301,29 @@ api = MarketplaceAPI()
 
 
 # ============================================================
+# MM DEALS (local JSON persistence)
+# ============================================================
+
+MM_DEALS_FILE = Path("mm_deals.json")
+
+def load_mm_deals():
+    if MM_DEALS_FILE.exists():
+        try:
+            return json.loads(MM_DEALS_FILE.read_text())
+        except Exception as e:
+            print(f"[MM DEALS LOAD] {e}")
+    return {}
+
+def save_mm_deals(data):
+    try:
+        MM_DEALS_FILE.write_text(json.dumps(data, indent=2))
+    except Exception as e:
+        print(f"[MM DEALS SAVE] {e}")
+
+_mm_deals = load_mm_deals()
+
+
+# ============================================================
 # HELPERS
 # ============================================================
 
@@ -393,6 +420,70 @@ async def safe_error(
         print(
             f"[ERROR RESPONSE] {e}"
         )
+
+
+# ============================================================
+# LOCKED CHANNEL + MM HELPERS
+# ============================================================
+
+def is_locked_channel(channel, config):
+    """A channel where only the bot may post. Everyone
+    else's messages are auto-deleted."""
+
+    locked_id = (config or {}).get("locked_channel_id")
+
+    if locked_id:
+        try:
+            if int(locked_id) == channel.id:
+                return True
+        except (TypeError, ValueError):
+            pass
+
+    # Middleman ticket channels created by /mm are
+    # always locked so only the deal UI stays visible.
+    name = getattr(channel, "name", "") or ""
+
+    if name.startswith("need-middleman-"):
+        return True
+
+    return False
+
+
+async def cached_config_safe(guild_id):
+    try:
+        return await cached_config(guild_id)
+    except Exception:
+        return {}
+
+
+def mm_deal_embed(deal):
+    """Build the deal confirmation card."""
+
+    item = deal.get("item") or "—"
+    price = deal.get("price") or "—"
+    payment = deal.get("payment_method") or "—"
+
+    header = f"{item} | {money(price)} | {payment}"
+
+    names = deal.get("names", {})
+    confirmed = deal.get("confirmed", {})
+
+    lines = []
+
+    for uid in deal.get("participants", []):
+        name = names.get(uid, f"<@{uid}>")
+        status = "Confirmed ✅" if confirmed.get(uid) else "Unconfirmed ❌"
+        lines.append(f"{name}: {status}")
+
+    description = (
+        f"**{header}**\n\n"
+        + "\n".join(lines)
+        + "\n\nPlease confirm the trade by pressing the "
+        "'Confirm' button below. If this deal is not "
+        "accurate, please click 'Edit Deal'"
+    )
+
+    return discord.Embed(description=description, color=discord.Color.blue())
 
 
 # ============================================================
@@ -622,6 +713,8 @@ class SDBSTBot(commands.Bot):
             self.views_restored = True
 
             await restore_persistent_views()
+
+            await restore_mm_views()
 
 
     async def close(self):
@@ -1188,47 +1281,63 @@ class StickySettingsButton(discord.ui.Button):
         )
 
 
-class CommandOnlyChannelModal(discord.ui.Modal):
-
-    def __init__(self, parent):
-        super().__init__(title="🔒 Command-Only Channel")
-        self.parent_view = parent
-        self.channel_input = discord.ui.TextInput(
-            label="Channel ID (or type off to disable)",
-            placeholder="123456789012345678",
-            default=str(parent.config.get("command_only_channel_id", "")),
-            max_length=30,
-            required=False
-        )
-        self.add_item(self.channel_input)
-
-    async def on_submit(self, interaction: discord.Interaction):
-        raw = self.channel_input.value.strip().lower()
-        if raw in {"", "off", "none", "disable"}:
-            await self.parent_view.save(interaction, "command_only_channel_id", "")
-            return
-        try:
-            channel_id = int(raw)
-        except ValueError:
-            await safe_error(interaction, "❌ Enter a valid channel ID, or type `off`.")
-            return
-        channel = interaction.guild.get_channel(channel_id)
-        if not isinstance(channel, discord.TextChannel):
-            await safe_error(interaction, "❌ I couldn't find a text channel with that ID in this server.")
-            return
-        await self.parent_view.save(interaction, "command_only_channel_id", str(channel.id))
-        await self.parent_view.save(interaction, "command_only_enabled", "true")
-
-
-class CommandOnlyChannelButton(discord.ui.Button):
+class ChannelBackButton(discord.ui.Button):
 
     def __init__(self, parent):
         self.parent_view = parent
-        configured = bool(parent.config.get("command_only_channel_id"))
         super().__init__(
-            label="Command-Only: ON" if configured else "Command-Only: OFF",
+            label="Back to Setup",
+            emoji="⬅️",
+            style=discord.ButtonStyle.primary,
+            row=1
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        view = SetupView(self.parent_view.guild, self.parent_view.config)
+        await interaction.response.edit_message(embed=view.build_embed(), view=view)
+
+
+class ChannelSettingsView(discord.ui.View):
+    """
+    Extra channel settings that don't fit on the main
+    setup panel (Discord's 5-row limit).
+    """
+
+    def __init__(self, guild, config):
+        super().__init__(timeout=300)
+        self.guild = guild
+        self.config = dict(config or {})
+        self.add_item(ConfigChannelSelect(self, "locked_channel_id", "🔒 Locked Channel (auto-delete)", [discord.ChannelType.text]))
+        self.add_item(ChannelBackButton(self))
+
+    def build_embed(self):
+        return channel_settings_embed(self.guild, self.config)
+
+    async def save(self, interaction, key, value):
+        try:
+            await api.patch_config(interaction.guild.id, {key: str(value)})
+        except Exception as e:
+            print(f"[CHANNEL SETUP] {e}")
+            await safe_error(interaction, "❌ Couldn't save that setting to the backend.")
+            return
+        self.config[key] = str(value)
+        invalidate_config_cache(interaction.guild.id)
+        refreshed = ChannelSettingsView(self.guild, self.config)
+        try:
+            await interaction.response.edit_message(embed=refreshed.build_embed(), view=refreshed)
+        except Exception as e:
+            print(f"[CHANNEL REFRESH] {e}")
+            await safe_error(interaction, "✅ Channel settings updated.")
+
+
+class ChannelSettingsButton(discord.ui.Button):
+
+    def __init__(self, parent):
+        self.parent_view = parent
+        super().__init__(
+            label="Channels",
             emoji="🔒",
-            style=discord.ButtonStyle.success if configured else discord.ButtonStyle.secondary,
+            style=discord.ButtonStyle.secondary,
             row=4
         )
 
@@ -1236,7 +1345,8 @@ class CommandOnlyChannelButton(discord.ui.Button):
         if not interaction.user.guild_permissions.administrator:
             await safe_error(interaction, "❌ Administrator permissions required.")
             return
-        await interaction.response.send_modal(CommandOnlyChannelModal(self.parent_view))
+        view = ChannelSettingsView(self.parent_view.guild, self.parent_view.config)
+        await interaction.response.edit_message(embed=view.build_embed(), view=view)
 
 
 class SetupView(discord.ui.View):
@@ -1300,7 +1410,7 @@ class SetupView(discord.ui.View):
         )
 
         self.add_item(
-            CommandOnlyChannelButton(self)
+            ChannelSettingsButton(self)
         )
 
 
@@ -1406,16 +1516,16 @@ def setup_embed(guild, server_config):
         )
     )
 
+    locked_ch = configured_channel(
+        guild,
+        server_config.get(
+            "locked_channel_id"
+        )
+    )
+
     sticky_status = (
         "🟢 Enabled"
         if sticky_enabled(server_config)
-        else "🔴 Disabled"
-    )
-
-    command_only_id = server_config.get("command_only_channel_id")
-    command_only_status = (
-        f"🟢 {configured_channel(guild, command_only_id)}"
-        if command_only_id and str(server_config.get("command_only_enabled", "true")).lower() not in {"false", "0", "off", "no"}
         else "🔴 Disabled"
     )
 
@@ -1438,11 +1548,42 @@ def setup_embed(guild, server_config):
             f"🤝 **MM Channel:** "
             f"{mm_ch}\n"
 
-            f"📌 **Sticky Notes:** "
-            f"{sticky_status}\n"
+            f"🔒 **Locked Channel:** "
+            f"{locked_ch}\n"
 
-            f"🔒 **Command-Only Channel:** "
-            f"{command_only_status}"
+            f"📌 **Sticky Notes:** "
+            f"{sticky_status}"
+        ),
+        color=discord.Color.blurple()
+    )
+
+    embed.set_footer(
+        text=(
+            "Only server administrators "
+            "can configure the bot."
+        )
+    )
+
+    return embed
+
+
+def channel_settings_embed(guild, server_config):
+
+    locked_ch = configured_channel(
+        guild,
+        server_config.get("locked_channel_id")
+    )
+
+    embed = discord.Embed(
+        title="🔒 Channel Settings",
+        description=(
+            "Extra channel configuration.\n\n"
+            "🔒 **Locked Channel:** "
+            f"{locked_ch}\n\n"
+            "In the locked channel the bot auto-deletes "
+            "any message that isn't its own, so only the "
+            "bot's messages stay. Middleman ticket "
+            "channels are always locked."
         ),
         color=discord.Color.blurple()
     )
@@ -2014,13 +2155,6 @@ class AdButtons(discord.ui.View):
                 )
             )
 
-            # The second bot-style panel starts the participant selection and
-            # is deliberately separate from the ticket controls above.
-            await ticket_channel.send(
-                content="🤝 **Who are you dealing with?**",
-                view=DealSetupView(ticket_record)
-            )
-
         except Exception as e:
 
             print(
@@ -2174,186 +2308,6 @@ class AdButtons(discord.ui.View):
 
 
 # ============================================================
-# DEAL SETUP AND CONFIRMATION
-# ============================================================
-
-_deal_state = {}
-
-
-def _ticket_state_key(ticket):
-    return str(ticket.get("ticket_id") or ticket.get("channel_id"))
-
-
-def _initial_deal_state(ticket):
-    key = _ticket_state_key(ticket)
-    saved = ticket.get("deal") if isinstance(ticket.get("deal"), dict) else {}
-    state = dict(_deal_state.get(key, {}))
-    state.update(saved)
-    state.setdefault("item", ticket.get("item") or "Deal")
-    state.setdefault("value", ticket.get("deal_value") or ticket.get("price") or "Not set")
-    state.setdefault("partner_id", ticket.get("deal_partner_id") or ticket.get("seller_id"))
-    state.setdefault("confirmations", {})
-    _deal_state[key] = state
-    return state
-
-
-async def _save_deal_state(ticket, state):
-    key = _ticket_state_key(ticket)
-    _deal_state[key] = dict(state)
-    payload = {
-        "deal": state,
-        "deal_partner_id": str(state.get("partner_id")) if state.get("partner_id") else "",
-        "deal_value": str(state.get("value", "")),
-        "deal_item": str(state.get("item", ""))
-    }
-    try:
-        await api.update_ticket(ticket["ticket_id"], payload)
-    except Exception as e:
-        # The Discord flow remains usable if an older backend does not yet
-        # accept the optional deal fields; the state is retained in-process.
-        print(f"[DEAL STATE API] {e}")
-
-
-def _member_mention(guild, user_id):
-    try:
-        return guild.get_member(int(user_id)).mention
-    except (TypeError, ValueError, AttributeError):
-        return f"<@{user_id}>"
-
-
-def deal_embed(guild, ticket, state):
-    buyer_id = str(ticket.get("buyer_id"))
-    partner_id = str(state.get("partner_id")) if state.get("partner_id") else None
-    confirmations = state.get("confirmations", {})
-    buyer_ok = bool(confirmations.get(buyer_id))
-    partner_ok = bool(partner_id and confirmations.get(partner_id))
-    embed = discord.Embed(
-        title="🤝 Deal Confirmation",
-        description=(
-            f"**Deal:** {state.get('item', 'Deal')}\n"
-            f"**Value:** {money(state.get('value', 'Not set'))}\n\n"
-            f"{'✅' if buyer_ok else '❌'} {_member_mention(guild, buyer_id)} — {'Confirmed' if buyer_ok else 'Unconfirmed'}\n"
-            f"{'✅' if partner_ok else '❌'} {_member_mention(guild, partner_id) if partner_id else 'No user selected'} — {'Confirmed' if partner_ok else 'Unconfirmed'}"
-        ),
-        color=discord.Color.green() if buyer_ok and partner_ok else discord.Color.orange()
-    )
-    embed.set_footer(text="Both participants must confirm before the deal is complete.")
-    return embed
-
-
-class DealUserSelect(discord.ui.UserSelect):
-
-    def __init__(self, ticket):
-        self.ticket = ticket
-        super().__init__(placeholder="Select a user", min_values=1, max_values=1, custom_id="deal:select_user", row=0)
-
-    async def callback(self, interaction: discord.Interaction):
-        state = _initial_deal_state(self.ticket)
-        selected = self.values[0]
-        if selected.id == interaction.user.id and selected.id == int(self.ticket.get("buyer_id", 0)):
-            await safe_error(interaction, "❌ You cannot select yourself as the other deal participant.")
-            return
-        state["partner_id"] = str(selected.id)
-        state["confirmations"] = {}
-        await _save_deal_state(self.ticket, state)
-        view = DealConfirmationView(self.ticket, state)
-        await interaction.response.edit_message(
-            content=f"✅ {selected.mention} has been added to the deal. Please review and confirm below.",
-            embed=view.build_embed(interaction.guild),
-            view=view
-        )
-        try:
-            await interaction.channel.send(f"📌 {selected.mention} has been added to the ticket and the deal details were saved.")
-        except discord.HTTPException:
-            pass
-
-
-class DealSetupView(discord.ui.View):
-
-    def __init__(self, ticket):
-        super().__init__(timeout=None)
-        self.ticket = ticket
-        self.add_item(DealUserSelect(ticket))
-
-
-class EditDealModal(discord.ui.Modal):
-
-    def __init__(self, ticket, state):
-        super().__init__(title="✏️ Edit Deal")
-        self.ticket = ticket
-        self.item_input = discord.ui.TextInput(label="Deal details", default=str(state.get("item", "Deal")), max_length=100, required=True)
-        self.value_input = discord.ui.TextInput(label="Deal value (USD)", default=str(state.get("value", "")), max_length=20, required=True)
-        self.add_item(self.item_input)
-        self.add_item(self.value_input)
-
-    async def on_submit(self, interaction: discord.Interaction):
-        try:
-            value = float(self.value_input.value.replace("$", "").replace(",", "").strip())
-            if value < 0:
-                raise ValueError
-        except ValueError:
-            await safe_error(interaction, "❌ Deal value must be a valid number.")
-            return
-        state = _initial_deal_state(self.ticket)
-        state["item"] = self.item_input.value.strip()
-        state["value"] = str(value)
-        state["confirmations"] = {}
-        await _save_deal_state(self.ticket, state)
-        view = DealConfirmationView(self.ticket, state)
-        await interaction.response.edit_message(embed=view.build_embed(interaction.guild), view=view)
-        try:
-            await interaction.channel.send("💾 The deal details have been updated. Both participants must confirm again.")
-        except discord.HTTPException:
-            pass
-
-
-class DealConfirmationView(discord.ui.View):
-
-    def __init__(self, ticket, state=None):
-        super().__init__(timeout=None)
-        self.ticket = ticket
-        self.state = state or _initial_deal_state(ticket)
-
-    def build_embed(self, guild):
-        return deal_embed(guild, self.ticket, self.state)
-
-    async def _confirm(self, interaction, participant_key):
-        buyer_id = str(self.ticket.get("buyer_id"))
-        partner_id = str(self.state.get("partner_id")) if self.state.get("partner_id") else ""
-        if participant_key == "buyer":
-            allowed_id = buyer_id
-        else:
-            allowed_id = partner_id
-        if not allowed_id or interaction.user.id != int(allowed_id):
-            await safe_error(interaction, "❌ Only the matching deal participant can use this confirmation button.")
-            return
-        self.state.setdefault("confirmations", {})[allowed_id] = True
-        await _save_deal_state(self.ticket, self.state)
-        await interaction.response.edit_message(embed=self.build_embed(interaction.guild), view=self)
-        if all(self.state["confirmations"].get(x) for x in (buyer_id, partner_id)):
-            try:
-                await interaction.channel.send("✅ **Both participants confirmed the deal.**")
-            except discord.HTTPException:
-                pass
-
-    @discord.ui.button(label="Buyer Confirm", emoji="✅", style=discord.ButtonStyle.success, custom_id="deal:confirm:buyer", row=0)
-    async def buyer_confirm(self, interaction, button):
-        await self._confirm(interaction, "buyer")
-
-    @discord.ui.button(label="Partner Confirm", emoji="✅", style=discord.ButtonStyle.success, custom_id="deal:confirm:partner", row=0)
-    async def partner_confirm(self, interaction, button):
-        await self._confirm(interaction, "partner")
-
-    @discord.ui.button(label="Edit Deal", emoji="✏️", style=discord.ButtonStyle.primary, custom_id="deal:edit", row=1)
-    async def edit_deal(self, interaction, button):
-        buyer_id = int(self.ticket.get("buyer_id", 0))
-        partner_id = int(self.state.get("partner_id", 0)) if self.state.get("partner_id") else 0
-        if interaction.user.id not in {buyer_id, partner_id}:
-            await safe_error(interaction, "❌ Only a deal participant can edit the deal.")
-            return
-        await interaction.response.send_modal(EditDealModal(self.ticket, self.state))
-
-
 # TICKET BUTTONS
 # ============================================================
 
@@ -2839,6 +2793,426 @@ async def wts(
 
 
 # ============================================================
+# MIDDLEMAN (MM) FLOW
+# ============================================================
+
+class MMClaimButton(discord.ui.Button):
+
+    def __init__(self, deal_id):
+        super().__init__(
+            label="Claim",
+            emoji="🤝",
+            style=discord.ButtonStyle.success,
+            custom_id=f"mm:claim:{deal_id}"
+        )
+        self.deal_id = deal_id
+
+    async def callback(self, interaction: discord.Interaction):
+        deal = _mm_deals.get(self.deal_id)
+        if not deal:
+            await safe_error(interaction, "❌ This ticket is no longer active.")
+            return
+        if deal.get("claimed_by"):
+            await safe_error(interaction, "❌ This ticket has already been claimed.")
+            return
+        deal["claimed_by"] = str(interaction.user.id)
+        save_mm_deals(_mm_deals)
+        embed = (
+            interaction.message.embeds[0]
+            if interaction.message.embeds
+            else discord.Embed(title="Ticket Created")
+        )
+        embed.description = (
+            (embed.description or "")
+            + f"\n\n🤝 **Claimed by {interaction.user.mention}**"
+        )
+        try:
+            await interaction.response.edit_message(embed=embed, view=None)
+        except Exception as e:
+            print(f"[MM CLAIM EDIT] {e}")
+        try:
+            await interaction.channel.send(f"🤝 {interaction.user.mention} claimed this ticket.")
+        except Exception:
+            pass
+
+
+class MMClaimView(discord.ui.View):
+
+    def __init__(self, deal_id):
+        super().__init__(timeout=None)
+        self.deal_id = deal_id
+        self.add_item(MMClaimButton(deal_id))
+
+
+class MMUserSelect(discord.ui.UserSelect):
+
+    def __init__(self, deal_id):
+        super().__init__(
+            placeholder="Select a user",
+            min_values=1,
+            max_values=1,
+            custom_id=f"mm:select:{deal_id}"
+        )
+        self.deal_id = deal_id
+
+    async def callback(self, interaction: discord.Interaction):
+        deal = _mm_deals.get(self.deal_id)
+        if not deal:
+            await safe_error(interaction, "❌ This ticket is no longer active.")
+            return
+        if str(interaction.user.id) != deal.get("creator_id"):
+            await safe_error(interaction, "❌ Only the ticket creator can select the user they're dealing with.")
+            return
+        selected = self.values[0]
+        try:
+            await interaction.channel.set_permissions(
+                selected,
+                view_channel=True,
+                send_messages=True,
+                read_message_history=True
+            )
+        except Exception as e:
+            print(f"[MM ADD USER] {e}")
+        deal["participants"] = [deal["creator_id"], str(selected.id)]
+        deal["confirmed"] = {deal["creator_id"]: False, str(selected.id): False}
+        deal["names"] = {
+            deal["creator_id"]: (interaction.user.display_name or interaction.user.name),
+            str(selected.id): (getattr(selected, "display_name", None) or getattr(selected, "name", None) or str(selected))
+        }
+        deal["state"] = "entering_deal"
+        save_mm_deals(_mm_deals)
+        try:
+            await interaction.channel.send(f"✅ {selected.mention} has been added to the ticket.")
+        except Exception:
+            pass
+        await interaction.response.send_modal(EnterDealModal(self.deal_id))
+
+
+class MMSelectUserView(discord.ui.View):
+
+    def __init__(self, deal_id):
+        super().__init__(timeout=None)
+        self.deal_id = deal_id
+        self.add_item(MMUserSelect(deal_id))
+
+
+class EnterDealModal(discord.ui.Modal):
+
+    def __init__(self, deal_id, existing=None):
+        super().__init__(title="Enter Deal")
+        self.deal_id = deal_id
+        existing = existing or {}
+        self.item_input = discord.ui.TextInput(
+            label="Item Name",
+            placeholder="Item being traded",
+            max_length=100,
+            required=True,
+            default=str(existing.get("item", ""))
+        )
+        self.price_input = discord.ui.TextInput(
+            label="Price",
+            placeholder="Example: 50.00",
+            max_length=20,
+            required=True,
+            default=str(existing.get("price", ""))
+        )
+        self.payment_input = discord.ui.TextInput(
+            label="Payment Method",
+            placeholder="Example: PayPal, Crypto",
+            max_length=50,
+            required=True,
+            default=str(existing.get("payment_method", ""))
+        )
+        self.add_item(self.item_input)
+        self.add_item(self.price_input)
+        self.add_item(self.payment_input)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        try:
+            price = float(self.price_input.value)
+            if price <= 0:
+                raise ValueError
+        except ValueError:
+            await interaction.response.send_message("❌ Price must be a valid number greater than $0.", ephemeral=True)
+            return
+        deal = _mm_deals.get(self.deal_id)
+        if not deal:
+            await interaction.response.send_message("❌ This ticket is no longer active.", ephemeral=True)
+            return
+        deal["item"] = self.item_input.value.strip()
+        deal["price"] = str(price)
+        deal["payment_method"] = self.payment_input.value.strip()
+        deal["state"] = "confirming"
+        save_mm_deals(_mm_deals)
+        embed = mm_deal_embed(deal)
+        view = DealConfirmView(self.deal_id)
+        if deal.get("deal_message_id"):
+            try:
+                msg = await interaction.channel.fetch_message(int(deal["deal_message_id"]))
+                await msg.edit(embed=embed, view=view)
+            except Exception as e:
+                print(f"[MM EDIT CARD] {e}")
+            await interaction.response.send_message("✅ Deal updated.", ephemeral=True)
+        else:
+            try:
+                msg = await interaction.channel.send(embed=embed, view=view)
+                deal["deal_message_id"] = str(msg.id)
+                save_mm_deals(_mm_deals)
+                await interaction.response.send_message("✅ Deal saved.", ephemeral=True)
+            except Exception as e:
+                print(f"[MM SEND CARD] {e}")
+                await interaction.response.send_message("❌ Couldn't post the deal card.", ephemeral=True)
+
+
+class MMConfirmButton(discord.ui.Button):
+
+    def __init__(self, deal_id, user_id, label, style):
+        super().__init__(
+            label=label,
+            style=style,
+            custom_id=f"mm:confirm:{deal_id}:{user_id}",
+            row=0
+        )
+        self.deal_id = deal_id
+        self.user_id = user_id
+
+    async def callback(self, interaction: discord.Interaction):
+        deal = _mm_deals.get(self.deal_id)
+        if not deal:
+            await safe_error(interaction, "❌ This deal is no longer active.")
+            return
+        if str(interaction.user.id) != self.user_id:
+            await safe_error(interaction, "❌ This isn't your confirm button.")
+            return
+        deal["confirmed"][self.user_id] = True
+        save_mm_deals(_mm_deals)
+        embed = mm_deal_embed(deal)
+        view = DealConfirmView(self.deal_id)
+        all_confirmed = all(deal["confirmed"].get(uid) for uid in deal.get("participants", []))
+        if all_confirmed:
+            for child in view.children:
+                child.disabled = True
+        try:
+            await interaction.response.edit_message(embed=embed, view=view)
+        except Exception as e:
+            print(f"[MM CONFIRM EDIT] {e}")
+        if all_confirmed:
+            try:
+                await interaction.followup.send("✅ All participants confirmed. Deal complete!")
+            except Exception:
+                pass
+
+
+class MMEditDealButton(discord.ui.Button):
+
+    def __init__(self, deal_id):
+        super().__init__(
+            label="Edit Deal",
+            emoji="✏️",
+            style=discord.ButtonStyle.secondary,
+            custom_id=f"mm:edit:{deal_id}",
+            row=1
+        )
+        self.deal_id = deal_id
+
+    async def callback(self, interaction: discord.Interaction):
+        deal = _mm_deals.get(self.deal_id)
+        if not deal:
+            await safe_error(interaction, "❌ This deal is no longer active.")
+            return
+        if str(interaction.user.id) != deal.get("creator_id"):
+            await safe_error(interaction, "❌ Only the deal creator can edit the deal.")
+            return
+        await interaction.response.send_modal(EnterDealModal(self.deal_id, existing=deal))
+
+
+class MMCloseButton(discord.ui.Button):
+
+    def __init__(self, deal_id):
+        super().__init__(
+            label="Close Ticket",
+            emoji="🔒",
+            style=discord.ButtonStyle.danger,
+            custom_id=f"mm:close:{deal_id}",
+            row=1
+        )
+        self.deal_id = deal_id
+
+    async def callback(self, interaction: discord.Interaction):
+        deal = _mm_deals.get(self.deal_id)
+        if not deal:
+            await safe_error(interaction, "❌ This ticket is no longer active.")
+            return
+        if str(interaction.user.id) != deal.get("creator_id"):
+            await safe_error(interaction, "❌ Only the ticket creator can close this ticket.")
+            return
+        await interaction.response.send_message("🔒 Closing ticket...", ephemeral=True)
+        _mm_deals.pop(self.deal_id, None)
+        save_mm_deals(_mm_deals)
+        try:
+            await interaction.channel.delete(reason=f"MM ticket closed by {interaction.user}")
+        except Exception as e:
+            print(f"[MM CLOSE] {e}")
+
+
+class DealConfirmView(discord.ui.View):
+
+    def __init__(self, deal_id):
+        super().__init__(timeout=None)
+        self.deal_id = deal_id
+        deal = _mm_deals.get(deal_id, {})
+        participants = deal.get("participants", [])
+        confirmed = deal.get("confirmed", {})
+        names = deal.get("names", {})
+        for uid in participants:
+            name = names.get(uid, uid)
+            is_confirmed = confirmed.get(uid, False)
+            label = f"{name} Confirmed" if is_confirmed else f"{name} Confirm"
+            style = discord.ButtonStyle.primary if is_confirmed else discord.ButtonStyle.success
+            self.add_item(MMConfirmButton(deal_id, uid, label, style))
+        self.add_item(MMEditDealButton(deal_id))
+        self.add_item(MMCloseButton(deal_id))
+        if participants and all(confirmed.get(uid) for uid in participants):
+            for child in self.children:
+                child.disabled = True
+
+
+# ============================================================
+# /MM
+# ============================================================
+
+@bot.tree.command(
+    name="mm",
+    description="Request a middleman — opens an MM ticket."
+)
+async def mm(interaction: discord.Interaction):
+    if interaction.guild is None:
+        await safe_error(interaction, "❌ This command must be used inside a server.")
+        return
+    config = await get_server_config(interaction.guild.id)
+    category_id = config.get("ticket_category_id")
+    if not category_id:
+        await safe_error(interaction, "❌ Tickets aren't configured. Ask an admin to run `/setup`.")
+        return
+    try:
+        category_id = int(category_id)
+    except (TypeError, ValueError):
+        await safe_error(interaction, "❌ Ticket category configuration is invalid.")
+        return
+    category = interaction.guild.get_channel(category_id)
+    if not isinstance(category, discord.CategoryChannel):
+        await safe_error(interaction, "❌ The configured ticket category doesn't exist.")
+        return
+    await interaction.response.defer(ephemeral=True)
+    ticket_num = random.randint(1000, 9999)
+    channel_name = f"need-middleman-{ticket_num}"
+    overwrites = {
+        interaction.guild.default_role: discord.PermissionOverwrite(view_channel=False),
+        interaction.user: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True),
+        interaction.guild.me: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True, manage_channels=True)
+    }
+    try:
+        ticket_channel = await interaction.guild.create_text_channel(
+            name=channel_name,
+            category=category,
+            overwrites=overwrites,
+            topic=f"SDBST Middleman Ticket • {interaction.user}"
+        )
+    except discord.Forbidden:
+        await interaction.followup.send("❌ I don't have permission to create ticket channels.", ephemeral=True)
+        return
+    except discord.HTTPException as e:
+        print(f"[MM CHANNEL] {e}")
+        await interaction.followup.send("❌ Discord failed to create the ticket.", ephemeral=True)
+        return
+    deal_id = uuid.uuid4().hex[:8]
+    claim_embed = discord.Embed(
+        title="Ticket Created",
+        description=(
+            f"{interaction.user.mention}\n\n"
+            "Automatically state the user and deal in the ticket\n"
+            "To ensure ur safety\n"
+            "All activities within your MM tickets will be recorded including edited messages and deleted images"
+        ),
+        color=discord.Color.blue()
+    )
+    claim_embed.set_footer(text="SDBST Support | SDBST")
+    try:
+        claim_msg = await ticket_channel.send(embed=claim_embed, view=MMClaimView(deal_id))
+    except Exception as e:
+        print(f"[MM CLAIM MSG] {e}")
+        claim_msg = None
+    select_embed = discord.Embed(
+        description=(
+            "**Who are you dealing with?**\n"
+            "Please select from the dropdown, ping them, or type their user ID."
+        ),
+        color=discord.Color.blue()
+    )
+    try:
+        select_msg = await ticket_channel.send(embed=select_embed, view=MMSelectUserView(deal_id))
+    except Exception as e:
+        print(f"[MM SELECT MSG] {e}")
+        select_msg = None
+    _mm_deals[deal_id] = {
+        "guild_id": str(interaction.guild.id),
+        "ticket_channel_id": str(ticket_channel.id),
+        "creator_id": str(interaction.user.id),
+        "participants": [],
+        "confirmed": {},
+        "names": {},
+        "item": None,
+        "price": None,
+        "payment_method": None,
+        "claimed_by": None,
+        "claim_message_id": str(claim_msg.id) if claim_msg else None,
+        "select_message_id": str(select_msg.id) if select_msg else None,
+        "deal_message_id": None,
+        "state": "awaiting_user"
+    }
+    save_mm_deals(_mm_deals)
+    if claim_msg and select_msg:
+        await interaction.followup.send(f"🤝 Middleman ticket opened: {ticket_channel.mention}", ephemeral=True)
+    else:
+        await interaction.followup.send("⚠️ Ticket created, but some setup messages failed to send.", ephemeral=True)
+
+
+# ============================================================
+# RESTORE MM VIEWS
+# ============================================================
+
+async def restore_mm_views():
+    count = 0
+    for deal_id, deal in list(_mm_deals.items()):
+        guild = None
+        try:
+            guild = bot.get_guild(int(deal["guild_id"]))
+        except Exception:
+            guild = None
+        if guild is None:
+            continue
+        if deal.get("claim_message_id") and not deal.get("claimed_by"):
+            try:
+                bot.add_view(MMClaimView(deal_id), message_id=int(deal["claim_message_id"]))
+                count += 1
+            except Exception as e:
+                print(f"[RESTORE MM CLAIM] {e}")
+        if deal.get("select_message_id") and deal.get("state") == "awaiting_user":
+            try:
+                bot.add_view(MMSelectUserView(deal_id), message_id=int(deal["select_message_id"]))
+                count += 1
+            except Exception as e:
+                print(f"[RESTORE MM SELECT] {e}")
+        if deal.get("deal_message_id") and deal.get("state") == "confirming":
+            try:
+                bot.add_view(DealConfirmView(deal_id), message_id=int(deal["deal_message_id"]))
+                count += 1
+            except Exception as e:
+                print(f"[RESTORE MM DEAL] {e}")
+    print(f"[RESTORE MM] Restored {count} MM view(s).")
+
+
+# ============================================================
 # RESTORE PERSISTENT VIEWS
 # ============================================================
 
@@ -2976,14 +3350,10 @@ async def restore_persistent_views():
                         if message.author.id != bot.user.id:
                             continue
 
-                        if "Trade ticket opened" in (message.content or ""):
-                            bot.add_view(TicketButtons(ticket), message_id=message.id)
-                        elif "Who are you dealing with?" in (message.content or ""):
-                            bot.add_view(DealSetupView(ticket), message_id=message.id)
-                        elif "Deal Confirmation" in (message.content or ""):
-                            bot.add_view(DealConfirmationView(ticket), message_id=message.id)
-                        else:
-                            continue
+                        bot.add_view(
+                            TicketButtons(ticket),
+                            message_id=message.id
+                        )
 
                         total_tickets += 1
 
@@ -3030,19 +3400,6 @@ def invalidate_config_cache(guild_id):
         int(guild_id),
         None
     )
-
-
-def command_only_enabled(config):
-    if not (config or {}).get("command_only_channel_id"):
-        return False
-    return str((config or {}).get("command_only_enabled", "true")).strip().lower() not in {"0", "false", "no", "off"}
-
-
-def is_command_only_channel(config, channel_id):
-    try:
-        return command_only_enabled(config) and int(config.get("command_only_channel_id")) == int(channel_id)
-    except (TypeError, ValueError, AttributeError):
-        return False
 
 
 async def cached_config(guild_id):
@@ -3115,6 +3472,35 @@ async def on_message(message):
 
         return
 
+    config = await cached_config_safe(
+        message.guild.id
+    )
+
+    # ----------------------------------------------------
+    # Locked channel: auto-delete anything
+    # that isn't the bot's own message.
+    # ----------------------------------------------------
+
+    if (
+        message.author.id != bot.user.id
+        and is_locked_channel(
+            message.channel,
+            config
+        )
+    ):
+
+        try:
+
+            await message.delete()
+
+        except Exception as e:
+
+            print(
+                f"[LOCKED DELETE] {e}"
+            )
+
+        return
+
     # Never react to our own sticky note, otherwise
     # the bot would repost itself forever.
     if message.id in _sticky_messages.values():
@@ -3130,18 +3516,6 @@ async def on_message(message):
         return
 
     try:
-
-        config = await cached_config(message.guild.id)
-
-        # Slash commands are interactions, not regular messages. Therefore
-        # deleting every non-bot message here still leaves /wtb, /wts, and
-        # other slash commands usable in the configured channel.
-        if is_command_only_channel(config, message.channel.id) and not message.author.bot:
-            try:
-                await message.delete(reason="Command-only channel")
-            except (discord.Forbidden, discord.NotFound, discord.HTTPException) as e:
-                print(f"[COMMAND-ONLY DELETE] {e}")
-            return
 
         text = sticky_text_for_channel(
             config,
