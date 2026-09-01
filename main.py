@@ -639,6 +639,93 @@ bot = SDBSTBot()
 
 
 # ============================================================
+# STICKY NOTE CONFIG
+# ============================================================
+
+# Defaults used when the server hasn't written its own text.
+DEFAULT_STICKY_TEXTS = {
+    "buying_channel_id": (
+        "📌 **/wtb** — USE THIS COMMAND TO POST BUYING ADS"
+    ),
+    "selling_channel_id": (
+        "📌 **/wts** — USE THIS COMMAND TO POST SELLING ADS"
+    ),
+    "sticky_channel_id": (
+        "📌 **Stickied Message:** use the marketplace "
+        "commands to post your ad."
+    ),
+}
+
+# Which config keys can hold a sticky channel.
+STICKY_CHANNEL_KEYS = (
+    "buying_channel_id",
+    "selling_channel_id",
+    "sticky_channel_id",
+)
+
+# Per-channel custom text keys.
+STICKY_TEXT_KEYS = {
+    "buying_channel_id": "sticky_text_buying",
+    "selling_channel_id": "sticky_text_selling",
+    "sticky_channel_id": "sticky_text_custom",
+}
+
+
+def sticky_enabled(config):
+
+    value = (config or {}).get(
+        "sticky_enabled",
+        "true"
+    )
+
+    return str(value).strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on"
+    )
+
+
+def sticky_text_for_key(config, key):
+
+    custom = (config or {}).get(
+        STICKY_TEXT_KEYS[key]
+    )
+
+    if custom and str(custom).strip():
+        return str(custom).strip()
+
+    return DEFAULT_STICKY_TEXTS[key]
+
+
+def sticky_text_for_channel(config, channel_id):
+    """
+    Returns the sticky text for this channel,
+    or None if the channel has no sticky.
+    """
+
+    if not sticky_enabled(config):
+        return None
+
+    for key in STICKY_CHANNEL_KEYS:
+
+        raw = (config or {}).get(key)
+
+        if not raw:
+            continue
+
+        try:
+
+            if int(raw) == int(channel_id):
+                return sticky_text_for_key(config, key)
+
+        except (TypeError, ValueError):
+            continue
+
+    return None
+
+
+# ============================================================
 # SETUP VIEW
 # ============================================================
 
@@ -725,6 +812,382 @@ class ConfigChannelSelect(discord.ui.ChannelSelect):
         )
 
 
+class StickyTextModal(discord.ui.Modal):
+
+    def __init__(self, parent, key, label):
+
+        super().__init__(
+            title="📌 Sticky Message"
+        )
+
+        self.parent_view = parent
+        self.config_key = STICKY_TEXT_KEYS[key]
+
+        self.text_input = discord.ui.TextInput(
+            label=label,
+            style=discord.TextStyle.paragraph,
+            default=sticky_text_for_key(
+                parent.config,
+                key
+            ),
+            max_length=1800,
+            required=True
+        )
+
+        self.add_item(
+            self.text_input
+        )
+
+
+    async def on_submit(
+        self,
+        interaction: discord.Interaction
+    ):
+
+        await self.parent_view.save(
+            interaction,
+            self.config_key,
+            self.text_input.value.strip()
+        )
+
+
+class StickyTextButton(discord.ui.Button):
+
+    def __init__(self, parent, key, label, emoji):
+
+        self.parent_view = parent
+        self.sticky_key = key
+
+        super().__init__(
+            label=label,
+            emoji=emoji,
+            style=discord.ButtonStyle.secondary,
+            row=2
+        )
+
+
+    async def callback(
+        self,
+        interaction: discord.Interaction
+    ):
+
+        if not interaction.user.guild_permissions.administrator:
+
+            await safe_error(
+                interaction,
+                "❌ Administrator permissions required."
+            )
+
+            return
+
+        await interaction.response.send_modal(
+            StickyTextModal(
+                self.parent_view,
+                self.sticky_key,
+                self.label
+            )
+        )
+
+
+class StickyToggleButton(discord.ui.Button):
+
+    def __init__(self, parent):
+
+        self.parent_view = parent
+
+        on = sticky_enabled(parent.config)
+
+        super().__init__(
+            label=(
+                "Sticky Notes: ON"
+                if on
+                else "Sticky Notes: OFF"
+            ),
+            emoji="📌",
+            style=(
+                discord.ButtonStyle.success
+                if on
+                else discord.ButtonStyle.danger
+            ),
+            row=1
+        )
+
+
+    async def callback(
+        self,
+        interaction: discord.Interaction
+    ):
+
+        if not interaction.user.guild_permissions.administrator:
+
+            await safe_error(
+                interaction,
+                "❌ Administrator permissions required."
+            )
+
+            return
+
+        new_value = (
+            "false"
+            if sticky_enabled(self.parent_view.config)
+            else "true"
+        )
+
+        await self.parent_view.save(
+            interaction,
+            "sticky_enabled",
+            new_value
+        )
+
+
+class StickyBackButton(discord.ui.Button):
+
+    def __init__(self, parent):
+
+        self.parent_view = parent
+
+        super().__init__(
+            label="Back to Setup",
+            emoji="⬅️",
+            style=discord.ButtonStyle.primary,
+            row=3
+        )
+
+
+    async def callback(
+        self,
+        interaction: discord.Interaction
+    ):
+
+        view = SetupView(
+            self.parent_view.guild,
+            self.parent_view.config
+        )
+
+        await interaction.response.edit_message(
+            embed=view.build_embed(),
+            view=view
+        )
+
+
+class StickyView(discord.ui.View):
+    """
+    Sticky note settings: enable/disable, what to say,
+    and which extra channel gets one.
+    """
+
+    def __init__(self, guild, config):
+
+        super().__init__(
+            timeout=300
+        )
+
+        self.guild = guild
+
+        self.config = dict(
+            config or {}
+        )
+
+        self.add_item(
+            ConfigChannelSelect(
+                self,
+                "sticky_channel_id",
+                "📌 Extra Sticky Channel (optional)",
+                [discord.ChannelType.text]
+            )
+        )
+
+        self.add_item(
+            StickyToggleButton(self)
+        )
+
+        self.add_item(
+            StickyTextButton(
+                self,
+                "buying_channel_id",
+                "Buying Text",
+                "🟢"
+            )
+        )
+
+        self.add_item(
+            StickyTextButton(
+                self,
+                "selling_channel_id",
+                "Selling Text",
+                "🔵"
+            )
+        )
+
+        self.add_item(
+            StickyTextButton(
+                self,
+                "sticky_channel_id",
+                "Custom Text",
+                "📌"
+            )
+        )
+
+        self.add_item(
+            StickyBackButton(self)
+        )
+
+
+    def build_embed(self):
+
+        status = (
+            "🟢 Enabled"
+            if sticky_enabled(self.config)
+            else "🔴 Disabled"
+        )
+
+        custom_ch = configured_channel(
+            self.guild,
+            self.config.get("sticky_channel_id")
+        )
+
+        def preview(key):
+
+            text = sticky_text_for_key(
+                self.config,
+                key
+            )
+
+            text = text.replace("\n", " ")
+
+            if len(text) > 90:
+                text = text[:87] + "..."
+
+            return text
+
+        embed = discord.Embed(
+            title="📌 Sticky Note Settings",
+            description=(
+                "A sticky note is re-posted at the "
+                "bottom of the channel every time "
+                "someone talks, so it always stays "
+                "visible under the last ad.\n\n"
+
+                f"**Status:** {status}\n"
+                f"**Buying Channel:** "
+                f"{configured_channel(self.guild, self.config.get('buying_channel_id'))}\n"
+                f"**Selling Channel:** "
+                f"{configured_channel(self.guild, self.config.get('selling_channel_id'))}\n"
+                f"**Extra Sticky Channel:** {custom_ch}\n\n"
+
+                f"🟢 **Buying text:** {preview('buying_channel_id')}\n"
+                f"🔵 **Selling text:** {preview('selling_channel_id')}\n"
+                f"📌 **Custom text:** {preview('sticky_channel_id')}"
+            ),
+            color=discord.Color.gold()
+        )
+
+        embed.set_footer(
+            text=(
+                "Only server administrators "
+                "can configure the bot."
+            )
+        )
+
+        return embed
+
+
+    async def save(
+        self,
+        interaction,
+        key,
+        value
+    ):
+
+        try:
+
+            await api.patch_config(
+                interaction.guild.id,
+                {
+                    key: str(value)
+                }
+            )
+
+        except Exception as e:
+
+            print(
+                f"[STICKY SETUP] {e}"
+            )
+
+            await safe_error(
+                interaction,
+                "❌ Couldn't save that setting to the backend."
+            )
+
+            return
+
+        self.config[key] = str(value)
+
+        invalidate_config_cache(interaction.guild.id)
+
+        refreshed = StickyView(
+            self.guild,
+            self.config
+        )
+
+        try:
+
+            await interaction.response.edit_message(
+                embed=refreshed.build_embed(),
+                view=refreshed
+            )
+
+        except Exception as e:
+
+            print(
+                f"[STICKY REFRESH] {e}"
+            )
+
+            await safe_error(
+                interaction,
+                "✅ Sticky settings updated."
+            )
+
+
+class StickySettingsButton(discord.ui.Button):
+
+    def __init__(self, parent):
+
+        self.parent_view = parent
+
+        super().__init__(
+            label="Sticky Notes",
+            emoji="📌",
+            style=discord.ButtonStyle.secondary,
+            row=4
+        )
+
+
+    async def callback(
+        self,
+        interaction: discord.Interaction
+    ):
+
+        if not interaction.user.guild_permissions.administrator:
+
+            await safe_error(
+                interaction,
+                "❌ Administrator permissions required."
+            )
+
+            return
+
+        view = StickyView(
+            self.parent_view.guild,
+            self.parent_view.config
+        )
+
+        await interaction.response.edit_message(
+            embed=view.build_embed(),
+            view=view
+        )
+
+
 class SetupView(discord.ui.View):
 
     def __init__(
@@ -781,6 +1244,10 @@ class SetupView(discord.ui.View):
             )
         )
 
+        self.add_item(
+            StickySettingsButton(self)
+        )
+
 
     def build_embed(self):
 
@@ -823,6 +1290,8 @@ class SetupView(discord.ui.View):
         # so the saved selections stay visible.
 
         self.config[key] = str(value)
+
+        invalidate_config_cache(interaction.guild.id)
 
         refreshed = SetupView(
             self.guild,
@@ -882,6 +1351,12 @@ def setup_embed(guild, server_config):
         )
     )
 
+    sticky_status = (
+        "🟢 Enabled"
+        if sticky_enabled(server_config)
+        else "🔴 Disabled"
+    )
+
     embed = discord.Embed(
         title="⚙️ SDBST Marketplace Setup",
         description=(
@@ -899,7 +1374,10 @@ def setup_embed(guild, server_config):
             f"{ticket_cat}\n"
 
             f"🤝 **MM Channel:** "
-            f"{mm_ch}"
+            f"{mm_ch}\n"
+
+            f"📌 **Sticky Notes:** "
+            f"{sticky_status}"
         ),
         color=discord.Color.blurple()
     )
@@ -2272,17 +2750,8 @@ async def restore_persistent_views():
 
 
 # ============================================================
-# STICKY NOTES (buying / selling channels)
+# STICKY NOTES (buying / selling / custom channel)
 # ============================================================
-
-STICKY_TEXTS = {
-    "buying_channel_id": (
-        "📌 **/wtb** — USE THIS COMMAND TO POST BUYING ADS"
-    ),
-    "selling_channel_id": (
-        "📌 **/wts** — USE THIS COMMAND TO POST SELLING ADS"
-    ),
-}
 
 # guild_id -> (config, timestamp)
 _config_cache = {}
@@ -2292,6 +2761,17 @@ _sticky_messages = {}
 
 # channel_id -> last repost timestamp
 _sticky_last = {}
+
+# channels currently reposting their sticky
+_sticky_posting = set()
+
+
+def invalidate_config_cache(guild_id):
+
+    _config_cache.pop(
+        int(guild_id),
+        None
+    )
 
 
 async def cached_config(guild_id):
@@ -2310,84 +2790,94 @@ async def cached_config(guild_id):
     return config
 
 
-def sticky_key_for_channel(config, channel_id):
-
-    for key in STICKY_TEXTS:
-
-        raw = config.get(key)
-
-        if not raw:
-            continue
-
-        try:
-
-            if int(raw) == channel_id:
-                return key
-
-        except (TypeError, ValueError):
-            continue
-
-    return None
-
-
-async def refresh_sticky(channel, key):
+async def refresh_sticky(channel, text):
 
     now = time.time()
 
     if now - _sticky_last.get(channel.id, 0) < 5:
         return
 
+    if channel.id in _sticky_posting:
+        return
+
     _sticky_last[channel.id] = now
-
-    old_id = _sticky_messages.get(channel.id)
-
-    if old_id:
-
-        try:
-
-            old = await channel.fetch_message(old_id)
-
-            await old.delete()
-
-        except Exception:
-            pass
+    _sticky_posting.add(channel.id)
 
     try:
 
-        sent = await channel.send(
-            STICKY_TEXTS[key]
-        )
+        old_id = _sticky_messages.get(channel.id)
 
-        _sticky_messages[channel.id] = sent.id
+        if old_id:
 
-    except Exception as e:
+            try:
 
-        print(
-            f"[STICKY] {e}"
-        )
+                old = await channel.fetch_message(old_id)
+
+                await old.delete()
+
+            except Exception:
+                pass
+
+        try:
+
+            sent = await channel.send(text)
+
+            _sticky_messages[channel.id] = sent.id
+
+        except Exception as e:
+
+            print(
+                f"[STICKY] {e}"
+            )
+
+    finally:
+
+        _sticky_posting.discard(channel.id)
 
 
 @bot.event
 async def on_message(message):
 
-    if message.author.bot or message.guild is None:
+    if message.guild is None:
 
         await bot.process_commands(message)
 
         return
 
-    config = await cached_config(message.guild.id)
+    # Never react to our own sticky note, otherwise
+    # the bot would repost itself forever.
+    if message.id in _sticky_messages.values():
 
-    key = sticky_key_for_channel(
-        config,
-        message.channel.id
-    )
+        await bot.process_commands(message)
 
-    if key:
+        return
 
-        await refresh_sticky(
-            message.channel,
-            key
+    if message.channel.id in _sticky_posting:
+
+        await bot.process_commands(message)
+
+        return
+
+    try:
+
+        config = await cached_config(message.guild.id)
+
+        text = sticky_text_for_channel(
+            config,
+            message.channel.id
+        )
+
+        if text:
+
+            await refresh_sticky(
+                message.channel,
+                text
+            )
+
+    except Exception as e:
+
+        print(
+            f"[STICKY CHECK] {e}"
         )
 
     await bot.process_commands(message)
