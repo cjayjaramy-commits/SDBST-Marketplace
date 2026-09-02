@@ -693,6 +693,7 @@ class SDBSTBot(commands.Bot):
     def __init__(self):
 
         intents = discord.Intents.default()
+        intents.message_content = True
 
         super().__init__(
             command_prefix="!",
@@ -1412,6 +1413,30 @@ class LockedChannelSelect(discord.ui.ChannelSelect):
         await self.parent_view.save(interaction, "locked_channel_ids", ids)
 
 
+class MMCategorySelect(discord.ui.ChannelSelect):
+
+    def __init__(self, parent):
+        self.parent_view = parent
+        super().__init__(
+            placeholder="🎫 MM Ticket Category (auto-detect)",
+            channel_types=[discord.ChannelType.category],
+            min_values=0,
+            max_values=1,
+            row=1,
+            default_values=channel_default(
+                parent.guild,
+                parent.config.get("mm_ticket_category_id")
+            )
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        if not interaction.user.guild_permissions.administrator:
+            await safe_error(interaction, "❌ Administrator permissions required.")
+            return
+        val = self.values[0].id if self.values else ""
+        await self.parent_view.save(interaction, "mm_ticket_category_id", val)
+
+
 class ChannelBackButton(discord.ui.Button):
 
     def __init__(self, parent):
@@ -1420,7 +1445,7 @@ class ChannelBackButton(discord.ui.Button):
             label="Back to Setup",
             emoji="⬅️",
             style=discord.ButtonStyle.primary,
-            row=1
+            row=2
         )
 
     async def callback(self, interaction: discord.Interaction):
@@ -1452,7 +1477,7 @@ class MMAutoDetectToggle(discord.ui.Button):
                 if on
                 else discord.ButtonStyle.danger
             ),
-            row=2
+            row=3
         )
 
     async def callback(self, interaction: discord.Interaction):
@@ -1509,7 +1534,7 @@ class MMPrefixButton(discord.ui.Button):
             label="MM Prefix",
             emoji="🏷️",
             style=discord.ButtonStyle.secondary,
-            row=2
+            row=3
         )
 
     async def callback(self, interaction: discord.Interaction):
@@ -1532,6 +1557,7 @@ class ChannelSettingsView(discord.ui.View):
         self.guild = guild
         self.config = dict(config or {})
         self.add_item(LockedChannelSelect(self))
+        self.add_item(MMCategorySelect(self))
         self.add_item(ChannelBackButton(self))
         self.add_item(MMAutoDetectToggle(self))
         self.add_item(MMPrefixButton(self))
@@ -1809,6 +1835,11 @@ def channel_settings_embed(guild, server_config):
         or "need-middleman-"
     )
 
+    mm_cat = configured_channel(
+        guild,
+        (server_config or {}).get("mm_ticket_category_id")
+    )
+
     embed = discord.Embed(
         title="🔒 Channel Settings",
         description=(
@@ -1822,11 +1853,13 @@ def channel_settings_embed(guild, server_config):
             "channels are always locked.\n\n"
             f"🤝 **MM Auto-Detect:** {'🟢 ON' if autodetect_on else '🔴 OFF'}\n"
             f"🏷️ **MM Ticket Prefix:** {prefix}\n\n"
+            f"🎫 **MM Ticket Category:** {mm_cat}\n"
             "When auto-detect is ON, the bot watches for "
             "ticket channels (created by Tickety or any "
-            "ticket bot) whose name starts with the "
-            "prefix, and automatically starts the "
-            "middleman deal flow inside them."
+            "ticket bot) in the MM Ticket Category, OR "
+            "whose name starts with the prefix, and "
+            "automatically starts the middleman deal "
+            "flow inside them."
         ),
         color=discord.Color.blurple()
     )
@@ -1881,6 +1914,87 @@ async def setup(
     await interaction.followup.send(
         embed=view.build_embed(),
         view=view,
+        ephemeral=True
+    )
+
+
+# ============================================================
+# /LOCKCHECK (diagnostic)
+# ============================================================
+
+@bot.tree.command(
+    name="lockcheck",
+    description="Debug: check if this channel is locked."
+)
+@app_commands.checks.has_permissions(
+    administrator=True
+)
+async def lockcheck(
+    interaction: discord.Interaction
+):
+
+    if interaction.guild is None:
+
+        await interaction.response.send_message(
+            "❌ Use in a server.",
+            ephemeral=True
+        )
+
+        return
+
+    config = await get_server_config(
+        interaction.guild.id
+    )
+
+    ids = locked_channel_ids(config)
+
+    locked = is_locked_channel(
+        interaction.channel,
+        config
+    )
+
+    prefix = str(
+        (config or {}).get("mm_ticket_prefix")
+        or "need-middleman-"
+    )
+
+    raw_ids = (config or {}).get(
+        "locked_channel_ids"
+    )
+
+    raw_single = (config or {}).get(
+        "locked_channel_id"
+    )
+
+    autodetect = str(
+        (config or {}).get("mm_autodetect", "true")
+    ).strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on"
+    )
+
+    msg = (
+        "**Lock Check**\n"
+        f"Channel: {interaction.channel.mention} "
+        f"(`{interaction.channel.id}`)\n"
+        f"Channel name: `{interaction.channel.name}`\n"
+        f"Is locked: "
+        f"{'🟢 YES' if locked else '🔴 NO'}\n"
+        f"Locked IDs in config: "
+        f"{sorted(ids) if ids else 'none'}\n"
+        f"raw locked_channel_ids: `{raw_ids}`\n"
+        f"raw locked_channel_id: `{raw_single}`\n"
+        f"MM prefix: `{prefix}`\n"
+        f"MM auto-detect: "
+        f"{'ON' if autodetect else 'OFF'}\n"
+        f"Name starts with prefix: "
+        f"{interaction.channel.name.startswith(prefix)}"
+    )
+
+    await interaction.response.send_message(
+        msg,
         ephemeral=True
     )
 
@@ -3743,6 +3857,13 @@ async def on_guild_channel_create(channel):
 
     name = getattr(channel, "name", "") or ""
 
+    print(
+        f"[CHANNEL CREATED] #{name} "
+        f"(id {getattr(channel, 'id', '?')}) "
+        f"in guild "
+        f"{getattr(channel.guild, 'id', '?')}"
+    )
+
     if not name or channel.guild is None:
         return
 
@@ -3758,15 +3879,41 @@ async def on_guild_channel_create(channel):
         "yes",
         "on"
     ):
+        print("[MM AUTODETECT] OFF — skipping")
         return
+
+    mm_cat = (config or {}).get("mm_ticket_category_id")
+    try:
+        mm_cat_id = int(mm_cat) if mm_cat else None
+    except (TypeError, ValueError):
+        mm_cat_id = None
 
     prefix = str(
         (config or {}).get("mm_ticket_prefix")
         or "need-middleman-"
     )
 
-    if not name.startswith(prefix):
+    cat_match = (
+        mm_cat_id is not None
+        and getattr(channel, "category_id", None) == mm_cat_id
+    )
+    prefix_match = name.startswith(prefix)
+
+    if not cat_match and not prefix_match:
+        print(
+            f"[MM AUTODETECT] #{name} does NOT match "
+            f"category {mm_cat_id} or prefix '{prefix}' "
+            f"(channel category: "
+            f"{getattr(channel, 'category_id', None)}) "
+            f"— skipping"
+        )
         return
+
+    print(
+        f"[MM AUTODETECT] #{name} matched "
+        f"({'category' if cat_match else 'prefix'}) "
+        f"— starting deal flow"
+    )
 
     # Skip channels the bot itself is creating via /mm
     # (registered before creation) to avoid double
@@ -3853,13 +4000,21 @@ async def on_message(message):
     # that isn't the bot's own message.
     # ----------------------------------------------------
 
-    if (
+    is_locked = (
         message.author.id != bot.user.id
         and is_locked_channel(
             message.channel,
             config
         )
-    ):
+    )
+
+    if is_locked:
+
+        print(
+            f"[LOCKED] msg from {message.author} "
+            f"in #{message.channel.name} "
+            f"(id {message.channel.id}) — deleting"
+        )
 
         try:
 
