@@ -566,19 +566,12 @@ def is_locked_channel(channel, config):
     if channel.id in locked_channel_ids(config):
         return True
 
-    # Any channel inside the configured MM ticket
-    # category is locked so only the deal UI stays
-    # visible.
-    mm_cat = (config or {}).get("mm_ticket_category_id")
-    try:
-        mm_cat_id = int(mm_cat) if mm_cat else None
-    except (TypeError, ValueError):
-        mm_cat_id = None
-    if (
-        mm_cat_id is not None
-        and getattr(channel, "category_id", None) == mm_cat_id
-    ):
-        return True
+    # Note: channels inside the MM Ticket Category are
+    # NOT auto-locked anymore — that deleted every
+    # message in every ticket (including Tickety's
+    # support- tickets), blocking chat. Only channels
+    # whose name starts with the MM prefix (created by
+    # /mm) are auto-locked so the deal UI stays clean.
 
     # Middleman ticket channels (created by Tickety
     # or /mm) are always locked so only the deal UI
@@ -1918,10 +1911,9 @@ def channel_settings_embed(guild, server_config):
             "🔒 **Locked Channels:** "
             f"{locked_ch}\n\n"
             "In locked channels the bot auto-deletes "
-            "any message that isn't its own, so only the "
-            "bot's messages stay. You can lock multiple "
-            "channels at once. Middleman ticket "
-            "channels are always locked.\n\n"
+            "non-bot messages. Only `/mm` tickets "
+            "(prefix match) are auto-locked; Tickety "
+            "tickets stay chat-able.\n\n"
             f"🤝 **MM Auto-Detect:** {'🟢 ON' if autodetect_on else '🔴 OFF'}\n"
             f"🏷️ **MM Ticket Prefix:** {prefix}\n\n"
             f"🎫 **MM Ticket Category:** {mm_cat}\n"
@@ -2046,6 +2038,29 @@ async def lockcheck(
         "on"
     )
 
+    mm_cat_raw = (config or {}).get("mm_ticket_category_id")
+    mm_cat_id = None
+    try:
+        mm_cat_id = int(mm_cat_raw) if mm_cat_raw else None
+    except (TypeError, ValueError):
+        mm_cat_id = None
+    mm_cat_name = "❌ none configured"
+    if mm_cat_id is not None:
+        mm_cat_ch = interaction.guild.get_channel(mm_cat_id)
+        if mm_cat_ch:
+            mm_cat_name = f"{mm_cat_ch.name} (`{mm_cat_id}`)"
+        else:
+            mm_cat_name = f"⚠️ `{mm_cat_id}` (not found)"
+    ch_cat_id = getattr(interaction.channel, "category_id", None)
+    ch_cat_name = "None (no category)"
+    if ch_cat_id:
+        ch_cat_ch = interaction.guild.get_channel(ch_cat_id)
+        if ch_cat_ch:
+            ch_cat_name = f"{ch_cat_ch.name} (`{ch_cat_id}`)"
+        else:
+            ch_cat_name = f"`{ch_cat_id}`"
+    cat_match = (mm_cat_id is not None and ch_cat_id == mm_cat_id)
+
     msg = (
         "**Lock Check**\n"
         f"Channel: {interaction.channel.mention} "
@@ -2061,7 +2076,10 @@ async def lockcheck(
         f"MM auto-detect: "
         f"{'ON' if autodetect else 'OFF'}\n"
         f"Name starts with prefix: "
-        f"{interaction.channel.name.startswith(prefix)}"
+        f"{interaction.channel.name.startswith(prefix)}\n"
+        f"Channel category: {ch_cat_name}\n"
+        f"MM Ticket Category: {mm_cat_name}\n"
+        f"Category match: {'🟢 YES' if cat_match else '🔴 NO'}"
     )
 
     await interaction.response.send_message(
