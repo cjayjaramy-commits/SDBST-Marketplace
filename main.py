@@ -4098,7 +4098,7 @@ async def on_message(message):
     # ----------------------------------------------------
 
     is_locked = (
-        message.author.id != bot.user.id
+        not message.author.bot
         and is_locked_channel(
             message.channel,
             config
