@@ -134,10 +134,33 @@ class MarketplaceAPI:
 
 
     async def patch_config(self, server_id, data):
+        """
+        Save individual config keys.
 
-        response = await self.client.patch(
+        The backend may not support PATCH (or the config
+        record may not exist yet on first save), so do a
+        read-merge-write via PUT instead. This creates the
+        config on first save and updates single keys after.
+        """
+        current = {}
+
+        try:
+
+            current = await self.get_config(server_id)
+
+        except Exception as e:
+
+            print(f"[CONFIG READ] {e}")
+
+        if not isinstance(current, dict):
+
+            current = {}
+
+        current.update(data)
+
+        response = await self.client.put(
             f"/api/public/bot/config/{server_id}",
-            json=data
+            json=current
         )
 
         response.raise_for_status()
