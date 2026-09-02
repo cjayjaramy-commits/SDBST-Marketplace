@@ -166,6 +166,19 @@ class MarketplaceAPI:
 
         response.raise_for_status()
 
+        # Also persist locally so settings survive even
+        # if the backend strips unknown keys.
+
+        gid = str(int(server_id))
+
+        if gid not in _bot_config:
+
+            _bot_config[gid] = {}
+
+        _bot_config[gid].update(data)
+
+        save_bot_config(_bot_config)
+
         return response.json()
 
 
@@ -346,6 +359,30 @@ def save_mm_deals(data):
 
 _mm_deals = load_mm_deals()
 
+
+# ============================================================
+# BOT CONFIG (local persistence fallback)
+# ============================================================
+
+BOT_CONFIG_FILE = Path("bot_config.json")
+
+def load_bot_config():
+    if BOT_CONFIG_FILE.exists():
+        try:
+            return json.loads(BOT_CONFIG_FILE.read_text())
+        except Exception as e:
+            print(f"[BOT CONFIG LOAD] {e}")
+    return {}
+
+def save_bot_config(data):
+    try:
+        BOT_CONFIG_FILE.write_text(json.dumps(data, indent=2))
+    except Exception as e:
+        print(f"[BOT CONFIG SAVE] {e}")
+
+_bot_config = load_bot_config()
+
+
 # Channels the bot is about to create via /mm, so the
 # auto-detect handler knows to skip them (avoid double
 # posting the deal flow).
@@ -406,9 +443,11 @@ def ticket_channel_name(buyer, seller):
 
 async def get_server_config(guild_id):
 
+    backend = {}
+
     try:
 
-        return await api.get_config(
+        backend = await api.get_config(
             guild_id
         )
 
@@ -418,7 +457,25 @@ async def get_server_config(guild_id):
             f"[API] Failed to get config: {e}"
         )
 
-        return {}
+    if not isinstance(backend, dict):
+
+        backend = {}
+
+    # Local overrides so settings persist even if the
+    # backend strips unknown keys.
+
+    local = _bot_config.get(
+        str(int(guild_id)),
+        {}
+    )
+
+    merged = {}
+
+    merged.update(backend)
+
+    merged.update(local)
+
+    return merged
 
 
 def configured_channel(guild, channel_id):
