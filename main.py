@@ -4198,45 +4198,6 @@ async def on_app_command_error(
 # RUN
 # ============================================================
 
-if __name__ == "__main__":
-
-    print(
-        "============================================"
-    )
-
-    print(
-        "SDBST Marketplace Bot starting..."
-    )
-
-    print(
-        "============================================"
-    )
-
-    try:
-
-        bot.run(
-            DISCORD_TOKEN
-        )
-
-    except KeyboardInterrupt:
-
-        print(
-            "Bot stopped."
-        )
-
-    except Exception as e:
-
-        print(
-            f"[FATAL] {repr(e)}"
-        )
-
-    finally:
-
-        print(
-            "Bot shutdown complete."
-        )
-
-# ============================================================
 # (merged from bot_extras.py)
 # ============================================================
 
@@ -4621,3 +4582,43 @@ class StockCog(commands.Cog):
         }
         save_stock_posts(_stock_posts)
         await interaction.followup.send(f"✅ Stock item posted in {stock_channel.mention}.", ephemeral=True)
+
+if __name__ == "__main__":
+
+    print(
+        "============================================"
+    )
+
+    print(
+        "SDBST Marketplace Bot starting..."
+    )
+
+    print(
+        "============================================"
+    )
+
+    try:
+
+        bot.run(
+            DISCORD_TOKEN
+        )
+
+    except KeyboardInterrupt:
+
+        print(
+            "Bot stopped."
+        )
+
+    except Exception as e:
+
+        print(
+            f"[FATAL] {repr(e)}"
+        )
+
+    finally:
+
+        print(
+            "Bot shutdown complete."
+        )
+
+# ============================================================
