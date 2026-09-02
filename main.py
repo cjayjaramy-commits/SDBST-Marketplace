@@ -3891,18 +3891,30 @@ async def refresh_sticky(channel, text):
 
     try:
 
-        old_id = _sticky_messages.get(channel.id)
+        # Delete any existing sticky messages (tracked or
+        # left over from a previous run) so only one stays
+        # at the bottom of the channel.
+        try:
 
-        if old_id:
+            async for msg in channel.history(limit=20):
 
-            try:
+                if msg.author.id != bot.user.id:
+                    continue
 
-                old = await channel.fetch_message(old_id)
+                is_sticky = (
+                    msg.id == _sticky_messages.get(channel.id)
+                    or (msg.content or "").startswith("📌")
+                )
 
-                await old.delete()
+                if is_sticky:
+                    try:
+                        await msg.delete()
+                    except Exception:
+                        pass
 
-            except Exception:
-                pass
+        except Exception as e:
+
+            print(f"[STICKY CLEANUP] {e}")
 
         try:
 
@@ -3999,6 +4011,20 @@ async def on_guild_channel_create(channel):
     # the ticket (overwrites, opener, welcome message)
     # before we post the deal flow.
     await asyncio.sleep(2)
+
+    # Tickety may not grant our bot access to the ticket
+    # channel by default, so make sure we can see and
+    # post in it before trying to send the deal flow.
+    try:
+        await channel.set_permissions(
+            channel.guild.me,
+            view_channel=True,
+            send_messages=True,
+            read_message_history=True,
+            manage_messages=True
+        )
+    except Exception as e:
+        print(f"[MM AUTODETECT PERMS] {e}")
 
     opener = _find_ticket_opener(channel)
 
