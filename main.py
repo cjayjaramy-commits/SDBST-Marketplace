@@ -3467,7 +3467,7 @@ class MMConfirmButton(discord.ui.Button):
             print(f"[MM CONFIRM EDIT] {e}")
         if all_confirmed:
             try:
-                await interaction.followup.send("✅ All participants confirmed. Deal complete!")
+                await interaction.followup.send("✅ All participants confirmed. A middleman may now proceed with this ticket.")
             except Exception:
                 pass
 
