@@ -509,6 +509,20 @@ def is_locked_channel(channel, config):
     if channel.id in locked_channel_ids(config):
         return True
 
+    # Any channel inside the configured MM ticket
+    # category is locked so only the deal UI stays
+    # visible.
+    mm_cat = (config or {}).get("mm_ticket_category_id")
+    try:
+        mm_cat_id = int(mm_cat) if mm_cat else None
+    except (TypeError, ValueError):
+        mm_cat_id = None
+    if (
+        mm_cat_id is not None
+        and getattr(channel, "category_id", None) == mm_cat_id
+    ):
+        return True
+
     # Middleman ticket channels (created by Tickety
     # or /mm) are always locked so only the deal UI
     # stays visible. The prefix is configurable in
