@@ -1036,22 +1036,26 @@ class ConfigChannelSelect(discord.ui.ChannelSelect):
         parent,
         key,
         placeholder,
-        channel_types
+        channel_types,
+        row=None
     ):
 
         self.parent_view = parent
         self.config_key = key
 
-        super().__init__(
-            placeholder=placeholder,
-            channel_types=channel_types,
-            min_values=1,
-            max_values=1,
-            default_values=channel_default(
+        select_kwargs = {
+            "placeholder": placeholder,
+            "channel_types": channel_types,
+            "min_values": 1,
+            "max_values": 1,
+            "default_values": channel_default(
                 parent.guild,
                 parent.config.get(key)
             )
-        )
+        }
+        if row is not None:
+            select_kwargs["row"] = row
+        super().__init__(**select_kwargs)
 
 
     async def callback(
@@ -1619,6 +1623,13 @@ class ChannelSettingsView(discord.ui.View):
         self.config = dict(config or {})
         self.add_item(LockedChannelSelect(self))
         self.add_item(MMCategorySelect(self))
+        self.add_item(ConfigChannelSelect(
+            self,
+            "stock_channel_id",
+            "📦 Stock Post Channel (/stock post)",
+            [discord.ChannelType.text],
+            row=4
+        ))
         self.add_item(ChannelBackButton(self))
         self.add_item(MMAutoDetectToggle(self))
         self.add_item(MMPrefixButton(self))
@@ -1829,6 +1840,13 @@ def setup_embed(guild, server_config):
         )
     )
 
+    stock_ch = configured_channel(
+        guild,
+        server_config.get(
+            "stock_channel_id"
+        )
+    )
+
     locked_ch = locked_channel_mentions(
         guild,
         server_config
@@ -1858,6 +1876,9 @@ def setup_embed(guild, server_config):
 
             f"🤝 **MM Channel:** "
             f"{mm_ch}\n"
+
+            f"📦 **Stock Post Channel:** "
+            f"{stock_ch}\n"
 
             f"🔒 **Locked Channels:** "
             f"{locked_ch}\n"
@@ -4198,6 +4219,10 @@ async def on_app_command_error(
 # RUN
 # ============================================================
 
+# Startup is intentionally placed at the end of the file so every cog,
+# persistent view, and restoration function is defined before on_ready.
+
+# ============================================================
 # (merged from bot_extras.py)
 # ============================================================
 
@@ -4536,7 +4561,24 @@ class StockCog(commands.Cog):
         except ValueError:
             await safe_error(interaction, "❌ Price must be a valid number greater than $0.")
             return
-        stock_channel = channel or interaction.channel
+        config = await get_server_config(interaction.guild.id)
+        configured_stock_channel = config.get("stock_channel_id")
+        if channel is not None:
+            stock_channel = channel
+        elif configured_stock_channel:
+            try:
+                stock_channel = interaction.guild.get_channel(int(configured_stock_channel))
+            except (TypeError, ValueError):
+                stock_channel = None
+            if not isinstance(stock_channel, discord.TextChannel):
+                await safe_error(
+                    interaction,
+                    "❌ The configured stock channel is invalid or no longer exists. "
+                    "Update it under `/setup` → **Channels**."
+                )
+                return
+        else:
+            stock_channel = interaction.channel
         await interaction.response.defer(ephemeral=True)
         img = image_url or None
         file_to_send = None
@@ -4583,42 +4625,20 @@ class StockCog(commands.Cog):
         save_stock_posts(_stock_posts)
         await interaction.followup.send(f"✅ Stock item posted in {stock_channel.mention}.", ephemeral=True)
 
-if __name__ == "__main__":
-
-    print(
-        "============================================"
-    )
-
-    print(
-        "SDBST Marketplace Bot starting..."
-    )
-
-    print(
-        "============================================"
-    )
-
-    try:
-
-        bot.run(
-            DISCORD_TOKEN
-        )
-
-    except KeyboardInterrupt:
-
-        print(
-            "Bot stopped."
-        )
-
-    except Exception as e:
-
-        print(
-            f"[FATAL] {repr(e)}"
-        )
-
-    finally:
-
-        print(
-            "Bot shutdown complete."
-        )
 
 # ============================================================
+# RUN
+# ============================================================
+
+if __name__ == "__main__":
+    print("============================================")
+    print("SDBST Marketplace Bot starting...")
+    print("============================================")
+    try:
+        bot.run(DISCORD_TOKEN)
+    except KeyboardInterrupt:
+        print("Bot stopped.")
+    except Exception as e:
+        print(f"[FATAL] {repr(e)}")
+    finally:
+        print("Bot shutdown complete.")
