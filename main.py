@@ -3,6 +3,7 @@ import re
 from datetime import datetime, timezone
 
 import time
+import asyncio
 import discord
 from discord import app_commands
 from discord.ext import commands
@@ -345,6 +346,32 @@ def save_mm_deals(data):
 
 _mm_deals = load_mm_deals()
 
+# Channels the bot is about to create via /mm, so the
+# auto-detect handler knows to skip them (avoid double
+# posting the deal flow).
+_pending_mm_channels = set()
+
+
+def _find_ticket_opener(channel):
+    """Find the ticket opener from channel overwrites.
+
+    Tickety adds the opener as a member overwrite with
+    view access. We pick the first non-bot member who
+    can view the channel.
+    """
+    for target, ow in getattr(
+        channel,
+        "overwrites",
+        {}
+    ).items():
+        if (
+            isinstance(target, discord.Member)
+            and target.id != bot.user.id
+            and ow.view_channel
+        ):
+            return target
+    return None
+
 
 # ============================================================
 # HELPERS
@@ -449,27 +476,85 @@ async def safe_error(
 # LOCKED CHANNEL + MM HELPERS
 # ============================================================
 
+def locked_channel_ids(config):
+    """Return the set of locked channel IDs from config.
+
+    Supports the new multi-channel 'locked_channel_ids'
+    (comma-separated) and the old single 'locked_channel_id'.
+    """
+    cfg = config or {}
+    ids = set()
+    raw = cfg.get("locked_channel_ids")
+    if raw:
+        for part in str(raw).split(","):
+            part = part.strip()
+            if part:
+                try:
+                    ids.add(int(part))
+                except ValueError:
+                    pass
+    single = cfg.get("locked_channel_id")
+    if single:
+        try:
+            ids.add(int(single))
+        except (TypeError, ValueError):
+            pass
+    return ids
+
+
 def is_locked_channel(channel, config):
     """A channel where only the bot may post. Everyone
     else's messages are auto-deleted."""
 
-    locked_id = (config or {}).get("locked_channel_id")
+    if channel.id in locked_channel_ids(config):
+        return True
 
-    if locked_id:
-        try:
-            if int(locked_id) == channel.id:
-                return True
-        except (TypeError, ValueError):
-            pass
-
-    # Middleman ticket channels created by /mm are
-    # always locked so only the deal UI stays visible.
+    # Middleman ticket channels (created by Tickety
+    # or /mm) are always locked so only the deal UI
+    # stays visible. The prefix is configurable in
+    # /setup.
     name = getattr(channel, "name", "") or ""
 
-    if name.startswith("need-middleman-"):
+    prefix = str(
+        (config or {}).get("mm_ticket_prefix")
+        or "need-middleman-"
+    )
+
+    if name.startswith(prefix):
         return True
 
     return False
+
+
+def locked_channel_mentions(guild, config):
+    """Human-readable list of locked channels for embeds."""
+    ids = locked_channel_ids(config)
+    if not ids:
+        return "❌ None configured"
+    mentions = []
+    for cid in sorted(ids):
+        ch = guild.get_channel(cid)
+        if ch:
+            mentions.append(ch.mention)
+        else:
+            mentions.append(f"⚠️ unknown ({cid})")
+    return ", ".join(mentions)
+
+
+def locked_channel_defaults(guild, config):
+    """Pre-select currently locked channels in the dropdown."""
+    out = []
+    for cid in sorted(locked_channel_ids(config)):
+        ch = guild.get_channel(cid)
+        if ch is None:
+            continue
+        try:
+            out.append(
+                discord.SelectDefaultValue.from_channel(ch)
+            )
+        except Exception:
+            pass
+    return out
 
 
 async def cached_config_safe(guild_id):
@@ -1304,6 +1389,29 @@ class StickySettingsButton(discord.ui.Button):
         )
 
 
+class LockedChannelSelect(discord.ui.ChannelSelect):
+
+    def __init__(self, parent):
+        self.parent_view = parent
+        super().__init__(
+            placeholder="🔒 Locked Channels (auto-delete)",
+            channel_types=[discord.ChannelType.text],
+            min_values=0,
+            max_values=25,
+            default_values=locked_channel_defaults(
+                parent.guild,
+                parent.config
+            )
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        if not interaction.user.guild_permissions.administrator:
+            await safe_error(interaction, "❌ Administrator permissions required.")
+            return
+        ids = ",".join(str(c.id) for c in self.values)
+        await self.parent_view.save(interaction, "locked_channel_ids", ids)
+
+
 class ChannelBackButton(discord.ui.Button):
 
     def __init__(self, parent):
@@ -1320,6 +1428,99 @@ class ChannelBackButton(discord.ui.Button):
         await interaction.response.edit_message(embed=view.build_embed(), view=view)
 
 
+class MMAutoDetectToggle(discord.ui.Button):
+
+    def __init__(self, parent):
+        self.parent_view = parent
+        on = str(
+            (parent.config or {}).get("mm_autodetect", "true")
+        ).strip().lower() in (
+            "1",
+            "true",
+            "yes",
+            "on"
+        )
+        super().__init__(
+            label=(
+                "MM Auto-Detect: ON"
+                if on
+                else "MM Auto-Detect: OFF"
+            ),
+            emoji="🤝",
+            style=(
+                discord.ButtonStyle.success
+                if on
+                else discord.ButtonStyle.danger
+            ),
+            row=2
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        if not interaction.user.guild_permissions.administrator:
+            await safe_error(interaction, "❌ Administrator permissions required.")
+            return
+        on = str(
+            (self.parent_view.config or {}).get("mm_autodetect", "true")
+        ).strip().lower() in (
+            "1",
+            "true",
+            "yes",
+            "on"
+        )
+        await self.parent_view.save(
+            interaction,
+            "mm_autodetect",
+            "false" if on else "true"
+        )
+
+
+class MMPrefixModal(discord.ui.Modal):
+
+    def __init__(self, parent):
+        super().__init__(title="MM Ticket Prefix")
+        self.parent_view = parent
+        self.prefix_input = discord.ui.TextInput(
+            label="Ticket channel name prefix",
+            default=str(
+                (parent.config or {}).get("mm_ticket_prefix")
+                or "need-middleman-"
+            ),
+            max_length=30,
+            required=True
+        )
+        self.add_item(self.prefix_input)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        val = self.prefix_input.value.strip()
+        if not val:
+            await interaction.response.send_message(
+                "❌ Prefix can't be empty.",
+                ephemeral=True
+            )
+            return
+        await self.parent_view.save(interaction, "mm_ticket_prefix", val)
+
+
+class MMPrefixButton(discord.ui.Button):
+
+    def __init__(self, parent):
+        self.parent_view = parent
+        super().__init__(
+            label="MM Prefix",
+            emoji="🏷️",
+            style=discord.ButtonStyle.secondary,
+            row=2
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        if not interaction.user.guild_permissions.administrator:
+            await safe_error(interaction, "❌ Administrator permissions required.")
+            return
+        await interaction.response.send_modal(
+            MMPrefixModal(self.parent_view)
+        )
+
+
 class ChannelSettingsView(discord.ui.View):
     """
     Extra channel settings that don't fit on the main
@@ -1330,8 +1531,10 @@ class ChannelSettingsView(discord.ui.View):
         super().__init__(timeout=300)
         self.guild = guild
         self.config = dict(config or {})
-        self.add_item(ConfigChannelSelect(self, "locked_channel_id", "🔒 Locked Channel (auto-delete)", [discord.ChannelType.text]))
+        self.add_item(LockedChannelSelect(self))
         self.add_item(ChannelBackButton(self))
+        self.add_item(MMAutoDetectToggle(self))
+        self.add_item(MMPrefixButton(self))
 
     def build_embed(self):
         return channel_settings_embed(self.guild, self.config)
@@ -1539,11 +1742,9 @@ def setup_embed(guild, server_config):
         )
     )
 
-    locked_ch = configured_channel(
+    locked_ch = locked_channel_mentions(
         guild,
-        server_config.get(
-            "locked_channel_id"
-        )
+        server_config
     )
 
     sticky_status = (
@@ -1571,7 +1772,7 @@ def setup_embed(guild, server_config):
             f"🤝 **MM Channel:** "
             f"{mm_ch}\n"
 
-            f"🔒 **Locked Channel:** "
+            f"🔒 **Locked Channels:** "
             f"{locked_ch}\n"
 
             f"📌 **Sticky Notes:** "
@@ -1592,21 +1793,40 @@ def setup_embed(guild, server_config):
 
 def channel_settings_embed(guild, server_config):
 
-    locked_ch = configured_channel(
-        guild,
-        server_config.get("locked_channel_id")
+    locked_ch = locked_channel_mentions(guild, server_config)
+
+    autodetect_on = str(
+        (server_config or {}).get("mm_autodetect", "true")
+    ).strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on"
+    )
+
+    prefix = str(
+        (server_config or {}).get("mm_ticket_prefix")
+        or "need-middleman-"
     )
 
     embed = discord.Embed(
         title="🔒 Channel Settings",
         description=(
             "Extra channel configuration.\n\n"
-            "🔒 **Locked Channel:** "
+            "🔒 **Locked Channels:** "
             f"{locked_ch}\n\n"
-            "In the locked channel the bot auto-deletes "
+            "In locked channels the bot auto-deletes "
             "any message that isn't its own, so only the "
-            "bot's messages stay. Middleman ticket "
-            "channels are always locked."
+            "bot's messages stay. You can lock multiple "
+            "channels at once. Middleman ticket "
+            "channels are always locked.\n\n"
+            f"🤝 **MM Auto-Detect:** {'🟢 ON' if autodetect_on else '🔴 OFF'}\n"
+            f"🏷️ **MM Ticket Prefix:** {prefix}\n\n"
+            "When auto-detect is ON, the bot watches for "
+            "ticket channels (created by Tickety or any "
+            "ticket bot) whose name starts with the "
+            "prefix, and automatically starts the "
+            "middleman deal flow inside them."
         ),
         color=discord.Color.blurple()
     )
@@ -2883,9 +3103,11 @@ class MMUserSelect(discord.ui.UserSelect):
         if not deal:
             await safe_error(interaction, "❌ This ticket is no longer active.")
             return
-        if str(interaction.user.id) != deal.get("creator_id"):
+        if deal.get("creator_id") and str(interaction.user.id) != deal.get("creator_id"):
             await safe_error(interaction, "❌ Only the ticket creator can select the user they're dealing with.")
             return
+        if not deal.get("creator_id"):
+            deal["creator_id"] = str(interaction.user.id)
         selected = self.values[0]
         try:
             await interaction.channel.set_permissions(
@@ -2984,7 +3206,28 @@ class EnterDealModal(discord.ui.Modal):
                 await interaction.response.send_message("✅ Deal saved.", ephemeral=True)
             except Exception as e:
                 print(f"[MM SEND CARD] {e}")
-                await interaction.response.send_message("❌ Couldn't post the deal card.", ephemeral=True)
+                reason = str(e)
+                # If embeds are blocked, try a plain-text deal card
+                # so the trade can still proceed.
+                try:
+                    msg = await interaction.channel.send(
+                        content=f"**{deal.get('item')} | {money(deal.get('price'))} | {deal.get('payment_method')}**\n"
+                        + "\n".join(
+                            f"{deal.get('names', {}).get(uid, f'<@{uid}>')}: "
+                            + ("Confirmed ✅" if deal.get("confirmed", {}).get(uid) else "Unconfirmed ❌")
+                            for uid in deal.get("participants", [])
+                        ),
+                        view=view
+                    )
+                    deal["deal_message_id"] = str(msg.id)
+                    save_mm_deals(_mm_deals)
+                    await safe_error(interaction, "✅ Deal saved (plain text).")
+                except Exception as e2:
+                    print(f"[MM SEND CARD FALLBACK] {e2}")
+                    await safe_error(
+                        interaction,
+                        f"❌ Couldn't post the deal card: {reason}"
+                    )
 
 
 class MMConfirmButton(discord.ui.Button):
@@ -3129,6 +3372,9 @@ async def mm(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
     ticket_num = random.randint(1000, 9999)
     channel_name = f"need-middleman-{ticket_num}"
+    _pending_mm_channels.add(
+        (interaction.guild.id, channel_name)
+    )
     overwrites = {
         interaction.guild.default_role: discord.PermissionOverwrite(view_channel=False),
         interaction.user: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True),
@@ -3416,6 +3662,10 @@ _sticky_last = {}
 # channels currently reposting their sticky
 _sticky_posting = set()
 
+# channels we've already warned about missing
+# Manage Messages permission (locked channel)
+_locked_warned = set()
+
 
 def invalidate_config_cache(guild_id):
 
@@ -3487,6 +3737,105 @@ async def refresh_sticky(channel, text):
 
 
 @bot.event
+async def on_guild_channel_create(channel):
+    """Auto-start the MM deal flow when a ticket bot
+    (Tickety) creates a middleman ticket channel."""
+
+    name = getattr(channel, "name", "") or ""
+
+    if not name or channel.guild is None:
+        return
+
+    config = await cached_config_safe(
+        channel.guild.id
+    )
+
+    if not str(
+        (config or {}).get("mm_autodetect", "true")
+    ).strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on"
+    ):
+        return
+
+    prefix = str(
+        (config or {}).get("mm_ticket_prefix")
+        or "need-middleman-"
+    )
+
+    if not name.startswith(prefix):
+        return
+
+    # Skip channels the bot itself is creating via /mm
+    # (registered before creation) to avoid double
+    # posting the deal flow.
+    key = (channel.guild.id, name)
+
+    if key in _pending_mm_channels:
+        _pending_mm_channels.discard(key)
+        return
+
+    # Give the ticket bot a moment to finish setting up
+    # the ticket (overwrites, opener, welcome message)
+    # before we post the deal flow.
+    await asyncio.sleep(2)
+
+    opener = _find_ticket_opener(channel)
+
+    deal_id = uuid.uuid4().hex[:8]
+
+    select_embed = discord.Embed(
+        description=(
+            "**Who are you dealing with?**\n"
+            "Please select from the dropdown, "
+            "ping them, or type their user ID."
+        ),
+        color=discord.Color.blue()
+    )
+
+    try:
+
+        select_msg = await channel.send(
+            embed=select_embed,
+            view=MMSelectUserView(deal_id)
+        )
+
+    except Exception as e:
+
+        print(f"[MM AUTODETECT SEND] {e}")
+
+        return
+
+    _mm_deals[deal_id] = {
+        "guild_id": str(channel.guild.id),
+        "ticket_channel_id": str(channel.id),
+        "creator_id": (
+            str(opener.id) if opener else None
+        ),
+        "participants": [],
+        "confirmed": {},
+        "names": {},
+        "item": None,
+        "price": None,
+        "payment_method": None,
+        "claimed_by": None,
+        "claim_message_id": None,
+        "select_message_id": str(select_msg.id),
+        "deal_message_id": None,
+        "state": "awaiting_user"
+    }
+
+    save_mm_deals(_mm_deals)
+
+    print(
+        f"[MM AUTODETECT] Started deal {deal_id} "
+        f"in #{name}"
+    )
+
+
+@bot.event
 async def on_message(message):
 
     if message.guild is None:
@@ -3515,6 +3864,31 @@ async def on_message(message):
         try:
 
             await message.delete()
+
+        except discord.Forbidden:
+
+            print(
+                f"[LOCKED DELETE] Missing Manage Messages "
+                f"permission in #{message.channel}."
+            )
+
+            if message.channel.id not in _locked_warned:
+
+                _locked_warned.add(message.channel.id)
+
+                try:
+
+                    await message.channel.send(
+                        "⚠️ I need **Manage Messages** "
+                        "permission to lock this channel. "
+                        "Give the bot role Manage Messages, "
+                        "then messages here will be "
+                        "auto-deleted."
+                    )
+
+                except Exception:
+
+                    pass
 
         except Exception as e:
 
