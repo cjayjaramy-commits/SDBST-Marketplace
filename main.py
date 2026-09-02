@@ -692,7 +692,7 @@ def format_ad_text(
     return (
         f"{mention} "
         f"{ad_action_words(ad_type)} "
-        f"{item} at {money(price)}"
+        f"**__{item}__** at **__{money(price)}__**"
     )
 
 
@@ -778,13 +778,12 @@ class SDBSTBot(commands.Bot):
         # startup, so each guild is handled separately.
 
         # Commands are published GLOBALLY only.
-        #
-        # Previously they were ALSO copied into each
-        # guild, which made Discord show every command
-        # twice (2x /wtb, 2x /wts, 2x /setup).
-        #
         # Clear any leftover guild-scoped copies so only
         # the single global set remains.
+        try:
+            await self.add_cog(StockCog(self))
+        except Exception as e:
+            print(f"[STOCK COG] {e}")
 
         for guild_id in COMMAND_GUILD_IDS:
 
@@ -882,12 +881,10 @@ class SDBSTBot(commands.Bot):
         # Restore persistent views only once.
 
         if not self.views_restored:
-
             self.views_restored = True
-
             await restore_persistent_views()
-
             await restore_mm_views()
+            await restore_stock_views()
 
 
     async def close(self):
@@ -2815,44 +2812,29 @@ class TicketButtons(discord.ui.View):
 
             return
 
-        await interaction.response.send_message(
-            "🔒 Closing ticket...",
-            ephemeral=True
-        )
-
+        await interaction.response.send_message("🔒 Closing ticket...", ephemeral=True)
         try:
-
-            await api.close_ticket(
-                self.ticket["ticket_id"]
-            )
-
+            await api.close_ticket(self.ticket["ticket_id"])
         except Exception as e:
-
-            print(
-                f"[CLOSE TICKET API] {e}"
-            )
-
+            print(f"[CLOSE TICKET API] {e}")
+        guild = interaction.guild
         try:
-
-            await interaction.channel.delete(
-                reason=(
-                    f"Ticket closed by "
-                    f"{interaction.user}"
-                )
-            )
-
-        except discord.Forbidden:
-
-            print(
-                "[CLOSE TICKET] "
-                "Bot cannot delete ticket channel."
-            )
-
-        except discord.HTTPException as e:
-
-            print(
-                f"[CLOSE TICKET DELETE] {e}"
-            )
+            buyer = guild.get_member(buyer_id)
+            seller = guild.get_member(seller_id)
+            if buyer:
+                await interaction.channel.set_permissions(buyer, view_channel=False, send_messages=False, read_message_history=False)
+            if seller:
+                await interaction.channel.set_permissions(seller, view_channel=False, send_messages=False, read_message_history=False)
+        except Exception as e:
+            print(f"[CLOSE TICKET PERMS] {e}")
+        try:
+            await interaction.message.edit(view=ClosedTicketView(self.ticket))
+        except Exception as e:
+            print(f"[CLOSE TICKET EDIT] {e}")
+        try:
+            await interaction.channel.send("🔒 This ticket has been closed. Staff can reopen or delete it.")
+        except Exception:
+            pass
 
 
     # ========================================================
@@ -3079,12 +3061,9 @@ class AdModal(discord.ui.Modal):
 
         item = self.item_input.value.strip()
 
-        content = create_ad_text(
-            interaction,
-            item,
-            price,
-            self.ad_type
-        )
+        await delete_duplicate_ads(interaction.guild, interaction.user.id, self.ad_type, item)
+
+        content = create_ad_text(interaction, item, price, self.ad_type)
 
         # ----------------------------------------------------
         # Send message first so we get its Discord ID.
@@ -3785,57 +3764,29 @@ async def restore_persistent_views():
 
 
             for ticket in tickets:
-
-                if ticket.get("status") == "closed":
-                    continue
-
-                channel_id = ticket.get(
-                    "channel_id"
-                )
-
-                ticket_id = ticket.get(
-                    "ticket_id"
-                )
-
+                channel_id = ticket.get("channel_id")
+                ticket_id = ticket.get("ticket_id")
                 if not channel_id or not ticket_id:
                     continue
-
                 try:
-
-                    channel = guild.get_channel(
-                        int(channel_id)
-                    )
-
+                    channel = guild.get_channel(int(channel_id))
                 except (TypeError, ValueError):
-
                     channel = None
-
                 if channel is None:
                     continue
-
+                if ticket.get("status") == "closed":
+                    view_cls = ClosedTicketView
+                else:
+                    view_cls = TicketButtons
                 try:
-
-                    async for message in channel.history(
-                        limit=20
-                    ):
-
+                    async for message in channel.history(limit=20):
                         if message.author.id != bot.user.id:
                             continue
-
-                        bot.add_view(
-                            TicketButtons(ticket),
-                            message_id=message.id
-                        )
-
+                        bot.add_view(view_cls(ticket), message_id=message.id)
                         total_tickets += 1
-
                         break
-
                 except Exception as e:
-
-                    print(
-                        f"[RESTORE TICKET] {e}"
-                    )
+                    print(f"[RESTORE TICKET] {e}")
 
         except Exception as e:
 
@@ -4284,3 +4235,389 @@ if __name__ == "__main__":
         print(
             "Bot shutdown complete."
         )
+
+# ============================================================
+# (merged from bot_extras.py)
+# ============================================================
+
+# bot_extras.py — stock posts, closed-ticket views, and
+# duplicate-ad cleanup. Loaded as a cog by bot.py.
+# Imports from bot.py lazily at runtime, so it MUST be
+# imported after bot.py is fully loaded (done in setup_hook).
+
+import json
+import uuid
+from datetime import datetime
+from pathlib import Path
+
+import discord
+from discord import app_commands
+from discord.ext import commands
+
+
+# ============================================================
+# STOCK POSTS (local JSON persistence)
+# ============================================================
+
+STOCK_POSTS_FILE = Path("stock_posts.json")
+
+def load_stock_posts():
+    if STOCK_POSTS_FILE.exists():
+        try:
+            return json.loads(STOCK_POSTS_FILE.read_text())
+        except Exception as e:
+            print(f"[STOCK POSTS LOAD] {e}")
+    return {}
+
+def save_stock_posts(data):
+    try:
+        STOCK_POSTS_FILE.write_text(json.dumps(data, indent=2))
+    except Exception as e:
+        print(f"[STOCK POSTS SAVE] {e}")
+
+_stock_posts = load_stock_posts()
+
+
+# ============================================================
+# TRADE TICKET HELPER
+# ============================================================
+
+async def create_trade_ticket(guild, buyer, seller, item, price, ad_id):
+    """Create a trade ticket between a buyer and seller.
+    Returns {ok, channel, record, error}."""
+    config = await get_server_config(guild.id)
+    category_id = config.get("ticket_category_id")
+    if not category_id:
+        return {"ok": False, "error": "❌ Tickets aren't configured. Ask an administrator to run `/setup`."}
+    try:
+        category_id = int(category_id)
+    except (TypeError, ValueError):
+        return {"ok": False, "error": "❌ Ticket category configuration is invalid."}
+    category = guild.get_channel(category_id)
+    if not isinstance(category, discord.CategoryChannel):
+        return {"ok": False, "error": "❌ The configured ticket category doesn't exist."}
+    try:
+        tickets = await api.list_tickets(guild.id)
+        for ticket in tickets:
+            if ticket.get("status") != "open":
+                continue
+            if str(ticket.get("buyer_id")) == str(buyer.id) and str(ticket.get("seller_id")) == str(seller.id):
+                ex_id = ticket.get("channel_id")
+                if ex_id:
+                    try:
+                        existing = guild.get_channel(int(ex_id))
+                    except (TypeError, ValueError):
+                        existing = None
+                    if existing:
+                        return {"ok": False, "error": f"❌ You already have a ticket: {existing.mention}"}
+    except Exception as e:
+        print(f"[TICKET CHECK] {e}")
+    ticket_name = ticket_channel_name(buyer, seller)
+    overwrites = {
+        guild.default_role: discord.PermissionOverwrite(view_channel=False),
+        seller: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True),
+        buyer: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True),
+        guild.me: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True, manage_channels=True),
+    }
+    try:
+        ticket_channel = await guild.create_text_channel(
+            name=ticket_name, category=category, overwrites=overwrites,
+            topic=f"SDBST Trade • {item} • {money(price)}"
+        )
+    except discord.Forbidden:
+        return {"ok": False, "error": "❌ I don't have permission to create ticket channels."}
+    except discord.HTTPException as e:
+        print(f"[CHANNEL CREATE] {e}")
+        return {"ok": False, "error": "❌ Discord failed to create the ticket."}
+    ticket_data = {
+        "server_id": str(guild.id), "ad_id": str(ad_id),
+        "channel_id": str(ticket_channel.id),
+        "buyer_id": str(buyer.id), "seller_id": str(seller.id),
+    }
+    try:
+        ticket_record = await api.create_ticket(ticket_data)
+    except Exception as e:
+        print(f"[TICKET API] {e}")
+        try:
+            await ticket_channel.delete(reason="Backend ticket creation failed")
+        except Exception:
+            pass
+        return {"ok": False, "error": "❌ The ticket couldn't be saved to the backend. Please try again."}
+    return {"ok": True, "channel": ticket_channel, "record": ticket_record}
+
+
+# ============================================================
+# STOCK BUTTONS
+# ============================================================
+
+class StockBuyButton(discord.ui.Button):
+    def __init__(self, post_id):
+        super().__init__(label="Buy This Item", emoji="🛒", style=discord.ButtonStyle.secondary, custom_id=f"stock:buy:{post_id}")
+        self.post_id = post_id
+
+    async def callback(self, interaction: discord.Interaction):
+        post = _stock_posts.get(self.post_id)
+        if not post:
+            await safe_error(interaction, "❌ This stock item is no longer available.")
+            return
+        guild = interaction.guild
+        if guild is None:
+            await safe_error(interaction, "❌ This can only be used inside a server.")
+            return
+        try:
+            seller = await guild.fetch_member(int(post["poster_id"]))
+        except Exception as e:
+            print(f"[STOCK BUY SELLER] {e}")
+            await safe_error(interaction, "❌ Couldn't find the seller.")
+            return
+        if interaction.user.id == seller.id:
+            await safe_error(interaction, "❌ You can't buy your own stock item.")
+            return
+        result = await create_trade_ticket(guild, interaction.user, seller, post.get("name"), post.get("price"), f"stock-{self.post_id}")
+        if not result["ok"]:
+            await safe_error(interaction, result["error"])
+            return
+        ticket_channel = result["channel"]
+        ticket_record = result["record"]
+        ticket_message = None
+        try:
+            ticket_message = await ticket_channel.send(
+                content=(
+                    f"{seller.mention} {interaction.user.mention}\n\n"
+                    f"🎫 **Trade ticket opened**\n"
+                    f"**Item:** {post.get('name')}\n"
+                    f"**Price:** {money(post.get('price'))}\n"
+                    f"**Buyer:** {interaction.user.mention}\n"
+                    f"**Seller:** {seller.mention}\n\n"
+                    f"{NEGOTIATE_LINE}"
+                ),
+                view=TicketButtons(ticket_record)
+            )
+        except Exception as e:
+            print(f"[STOCK TICKET MSG] {e}")
+        if ticket_message is not None:
+            ticket_link = ticket_message.jump_url
+        else:
+            ticket_link = f"https://discord.com/channels/{guild.id}/{ticket_channel.id}"
+        await interaction.response.send_message(
+            f"[Click here to open a ticket ✔️]({ticket_link})\n💬 Negotiate the deal in the opened ticket.",
+            ephemeral=True
+        )
+
+
+class StockSoldButton(discord.ui.Button):
+    def __init__(self, post_id):
+        super().__init__(label="Sold", emoji="✅", style=discord.ButtonStyle.danger, custom_id=f"stock:sold:{post_id}")
+        self.post_id = post_id
+
+    async def callback(self, interaction: discord.Interaction):
+        if not interaction.user.guild_permissions.administrator:
+            await safe_error(interaction, "❌ Only staff can mark items as sold.")
+            return
+        await interaction.response.send_message("✅ Marking as sold...", ephemeral=True)
+        _stock_posts.pop(self.post_id, None)
+        save_stock_posts(_stock_posts)
+        try:
+            await interaction.message.delete()
+        except Exception as e:
+            print(f"[STOCK SOLD DELETE] {e}")
+
+
+class StockPostButtons(discord.ui.View):
+    def __init__(self, post_id):
+        super().__init__(timeout=None)
+        self.post_id = post_id
+        self.add_item(StockBuyButton(post_id))
+        self.add_item(StockSoldButton(post_id))
+
+
+# ============================================================
+# CLOSED TICKET VIEW (reopen / delete — staff only)
+# ============================================================
+
+class ReopenTicketButton(discord.ui.Button):
+    def __init__(self, ticket):
+        super().__init__(label="Reopen Ticket", emoji="🔓", style=discord.ButtonStyle.success, custom_id="ticket:reopen")
+        self.ticket = ticket
+
+    async def callback(self, interaction: discord.Interaction):
+        if not interaction.user.guild_permissions.administrator:
+            await safe_error(interaction, "❌ Only staff can reopen tickets.")
+            return
+        guild = interaction.guild
+        try:
+            buyer_id = int(self.ticket["buyer_id"])
+            seller_id = int(self.ticket["seller_id"])
+        except (TypeError, ValueError, KeyError):
+            await safe_error(interaction, "❌ Invalid ticket data.")
+            return
+        try:
+            buyer = guild.get_member(buyer_id)
+            seller = guild.get_member(seller_id)
+            if buyer:
+                await interaction.channel.set_permissions(buyer, view_channel=True, send_messages=True, read_message_history=True)
+            if seller:
+                await interaction.channel.set_permissions(seller, view_channel=True, send_messages=True, read_message_history=True)
+        except Exception as e:
+            print(f"[REOPEN PERMS] {e}")
+        try:
+            await api.update_ticket(self.ticket["ticket_id"], {"status": "open"})
+        except Exception as e:
+            print(f"[REOPEN TICKET API] {e}")
+        try:
+            await interaction.response.edit_message(view=TicketButtons(self.ticket))
+        except Exception as e:
+            print(f"[REOPEN EDIT] {e}")
+        try:
+            await interaction.channel.send("🔓 Ticket reopened by staff.")
+        except Exception:
+            pass
+
+
+class DeleteTicketButton(discord.ui.Button):
+    def __init__(self, ticket):
+        super().__init__(label="Delete Ticket", emoji="🗑️", style=discord.ButtonStyle.danger, custom_id="ticket:delete")
+        self.ticket = ticket
+
+    async def callback(self, interaction: discord.Interaction):
+        if not interaction.user.guild_permissions.administrator:
+            await safe_error(interaction, "❌ Only staff can delete tickets.")
+            return
+        await interaction.response.send_message("🗑️ Deleting ticket...", ephemeral=True)
+        try:
+            await interaction.channel.delete(reason=f"Ticket deleted by {interaction.user}")
+        except Exception as e:
+            print(f"[DELETE TICKET] {e}")
+
+
+class ClosedTicketView(discord.ui.View):
+    def __init__(self, ticket):
+        super().__init__(timeout=None)
+        self.ticket = ticket
+        self.add_item(ReopenTicketButton(ticket))
+        self.add_item(DeleteTicketButton(ticket))
+
+
+# ============================================================
+# DUPLICATE AD CLEANUP
+# ============================================================
+
+async def delete_duplicate_ads(guild, user_id, ad_type, item):
+    try:
+        existing_ads = await api.list_ads(guild.id, limit=100)
+        for ad in existing_ads:
+            if ad.get("status") == "completed":
+                continue
+            if str(ad.get("owner_id")) != str(user_id):
+                continue
+            if ad.get("ad_type") != ad_type:
+                continue
+            if str(ad.get("item", "")).strip().lower() != item.lower():
+                continue
+            try:
+                old_ch = guild.get_channel(int(ad.get("channel_id")))
+                if old_ch:
+                    old_msg = await old_ch.fetch_message(int(ad.get("message_id")))
+                    await old_msg.delete()
+            except Exception as e:
+                print(f"[DUPE AD MSG] {e}")
+            try:
+                await api.delete_ad(ad["ad_id"])
+            except Exception as e:
+                print(f"[DUPE AD API] {e}")
+    except Exception as e:
+        print(f"[DUPE CHECK] {e}")
+
+
+# ============================================================
+# RESTORE STOCK VIEWS
+# ============================================================
+
+async def restore_stock_views():
+    count = 0
+    for post_id, post in list(_stock_posts.items()):
+        try:
+            bot.add_view(StockPostButtons(post_id), message_id=int(post["message_id"]))
+            count += 1
+        except Exception as e:
+            print(f"[RESTORE STOCK] {e}")
+    print(f"[RESTORE STOCK] Restored {count} stock view(s).")
+
+
+# ============================================================
+# STOCK COG (/stock post — staff only)
+# ============================================================
+
+class StockCog(commands.Cog):
+    def __init__(self, bot):
+        self.bot = bot
+
+    stock = app_commands.Group(name="stock", description="Stock management commands.")
+
+    @stock.command(name="post", description="Post a stock item (staff only).")
+    @app_commands.checks.has_permissions(administrator=True)
+    async def post(
+        self,
+        interaction: discord.Interaction,
+        name: str,
+        price: str,
+        channel: discord.TextChannel = None,
+        image_url: str = None,
+        image: discord.Attachment = None,
+    ):
+        if interaction.guild is None:
+            await safe_error(interaction, "❌ Use in a server.")
+            return
+        try:
+            price_val = float(price)
+            if price_val <= 0:
+                raise ValueError
+        except ValueError:
+            await safe_error(interaction, "❌ Price must be a valid number greater than $0.")
+            return
+        stock_channel = channel or interaction.channel
+        await interaction.response.defer(ephemeral=True)
+        img = image_url or None
+        file_to_send = None
+        if not img and image:
+            try:
+                file_to_send = await image.to_file()
+            except Exception as e:
+                print(f"[STOCK IMAGE] {e}")
+        if price_val == int(price_val):
+            price_str = f"${int(price_val):,}"
+        else:
+            price_str = f"${price_val:,.2f}"
+        now = datetime.now()
+        now_str = f"{now.month}/{now.day}/{str(now.year)[2:]}, {now.hour % 12 or 12}:{now.minute:02d} {'AM' if now.hour < 12 else 'PM'}"
+        embed = discord.Embed(title=name.upper(), color=discord.Color.blurple())
+        embed.add_field(name="💰 Price", value=price_str, inline=True)
+        embed.set_footer(text=f"SD Gems — Stock | {now_str}")
+        if img:
+            embed.set_thumbnail(url=img)
+        post_id = uuid.uuid4().hex[:8]
+        view = StockPostButtons(post_id)
+        try:
+            msg = await stock_channel.send(embed=embed, file=file_to_send, view=view)
+        except Exception as e:
+            print(f"[STOCK POST] {e}")
+            await interaction.followup.send("❌ Couldn't post the stock item.", ephemeral=True)
+            return
+        if file_to_send and msg.attachments:
+            img = msg.attachments[0].url
+            embed.set_thumbnail(url=img)
+            try:
+                await msg.edit(embed=embed)
+            except Exception as e:
+                print(f"[STOCK THUMB] {e}")
+        _stock_posts[post_id] = {
+            "guild_id": str(interaction.guild.id),
+            "channel_id": str(stock_channel.id),
+            "message_id": str(msg.id),
+            "poster_id": str(interaction.user.id),
+            "name": name,
+            "price": str(price_val),
+            "image": img or None,
+        }
+        save_stock_posts(_stock_posts)
+        await interaction.followup.send(f"✅ Stock item posted in {stock_channel.mention}.", ephemeral=True)
